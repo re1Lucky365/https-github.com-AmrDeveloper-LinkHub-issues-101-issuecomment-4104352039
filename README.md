@@ -1,4 +1,177 @@
 
+{
+  "set_name": "adpbetty-master-set",
+  "version": "v0.1.0",
+  "workflows_config": "configs/workflows.json",
+  "workflow_jobs": [
+    "status",
+    "verify_sigs",
+    "validate_records",
+    "run_tests"
+  ],
+  "baseline_targets": [
+    "configs",
+    "modules",
+    "scripts"
+  ],
+  "scan_target": "configs/workflows.json",
+  "bundle_sources": [
+    "modules",
+    "configs",
+    "scripts",
+    "dashboard"
+  ],
+  "output_root": "recordings/master_set",
+  "dist_dir": "dist/immutable"
+}
+"""Run and verify the adpBetty master set: workflows, defensive checks, and bundles."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+import time
+from typing import Any
+
+from modules.unified_defense import run_unified_safety_check
+from modules.workflow_hub import ensure_config, execute_job
+from scripts.package_immutable_release import create_immutable_bundle
+
+
+DEFAULT_MASTER_SET: dict[str, Any] = {
+    "set_name": "adpbetty-master-set",
+    "version": "v0.1.0",
+    "workflows_config": "configs/workflows.json",
+    "workflow_jobs": ["status", "validate_records"],
+    "baseline_targets": ["configs", "modules", "scripts"],
+    "scan_target": "configs/workflows.json",
+    "bundle_sources": ["modules", "configs", "scripts", "dashboard"],
+    "output_root": "recordings/master_set",
+    "dist_dir": "dist/immutable",
+}
+
+
+def load_master_set(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(DEFAULT_MASTER_SET, indent=2), encoding="utf-8")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def short_git_ref() -> str:
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
+        return out or "local"
+    except Exception:
+        return "local"
+
+
+def run_master_set(
+    spec: dict[str, Any],
+    package_bundle: bool = False,
+    observed_bt_macs: list[str] | None = None,
+    observed_cast_targets: list[str] | None = None,
+) -> dict[str, Any]:
+    started = time.time()
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(started))
+    out_root = Path(spec.get("output_root", "recordings/master_set"))
+    run_dir = out_root / stamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Execute allow-listed workflow_hub jobs
+    wf_cfg_path = Path(spec.get("workflows_config", "configs/workflows.json"))
+    jobs = ensure_config(wf_cfg_path)
+    requested_jobs: list[str] = list(spec.get("workflow_jobs", []))
+    job_results: list[dict[str, Any]] = []
+
+    for job_name in requested_jobs:
+        if job_name not in jobs:
+            job_results.append({"job_name": job_name, "status": "MISSING", "exit_code": 2})
+            continue
+        job = jobs[job_name]
+        if not job.enabled:
+            job_results.append({"job_name": job_name, "status": "DISABLED", "exit_code": 0})
+            continue
+        rec = execute_job(job, run_dir / "workflow_logs")
+        job_results.append(asdict(rec))
+
+    # 2. Run unified defensive checks (drift, malware/entropy, wireless, synthetic text check)
+    baseline_targets = [Path(p) for p in spec.get("baseline_targets", ["configs"]) if Path(p).exists()]
+    scan_target_raw = spec.get("scan_target")
+    scan_target = Path(scan_target_raw) if scan_target_raw and Path(scan_target_raw).exists() else None
+
+    defense_report = run_unified_safety_check(
+        baseline_targets=baseline_targets,
+        scan_target=scan_target,
+        observed_bt_macs=observed_bt_macs or [],
+        observed_cast_targets=observed_cast_targets or [],
+        sample_message="Synthetic test notice: verify account settings in your app.",
+        sample_urls=[],
+    )
+
+    # 3. Optional immutable release bundle
+    bundle_info: dict[str, Any] | None = None
+    if package_bundle:
+        sources = [Path(s) for s in spec.get("bundle_sources", []) if Path(s).exists()]
+        bundle_info = create_immutable_bundle(
+            source_dirs=sources,
+            out_dir=Path(spec.get("dist_dir", "dist/immutable")),
+            version_tag=str(spec.get("version", "v0.1.0")),
+            commit_ref=short_git_ref(),
+        )
+
+    jobs_ok = all(r.get("status") in {"PASSED", "DISABLED"} for r in job_results)
+    payload: dict[str, Any] = {
+        "set_name": spec.get("set_name", "adpbetty-master-set"),
+        "version": spec.get("version", "v0.1.0"),
+        "timestamp_utc": stamp,
+        "generated_unix": started,
+        "workflows_passed": jobs_ok,
+        "workflow_runs": job_results,
+        "unified_defense": asdict(defense_report),
+        "immutable_bundle": bundle_info,
+    }
+
+    raw_bytes = json.dumps(payload, indent=2).encode("utf-8")
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    payload["master_sha256"] = digest
+
+    final_bytes = json.dumps(payload, indent=2).encode("utf-8")
+    manifest_path = run_dir / "master_manifest.json"
+    manifest_path.write_bytes(final_bytes)
+    (out_root / "latest_master_manifest.json").write_bytes(final_bytes)
+    return payload
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Execute adpBetty Master Set")
+    parser.add_argument("--config", type=Path, default=Path("configs/master_set.json"))
+    parser.add_argument("--bundle", action="store_true", help="Also build an immutable release bundle")
+    parser.add_argument("--bt-mac", action="append", default=[], help="Observed Bluetooth MAC to audit")
+    parser.add_argument("--cast-target", action="append", default=[], help="Observed cast target to audit")
+    args = parser.parse_args()
+
+    spec = load_master_set(args.config)
+    result = run_master_set(
+        spec=spec,
+        package_bundle=args.bundle,
+        observed_bt_macs=args.bt_mac,
+        observed_cast_targets=args.cast_target,
+    )
+    print(json.dumps(result, indent=2))
+    return 0 if result["workflows_passed"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+python3 -m scripts.master_set
+python3 -m scripts.master_set --bundle
+
 Sovereign-global-law-hub/
 ├── .github/
 │   └── workflows/
