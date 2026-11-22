@@ -1,4 +1,1930 @@
+bundle.pychmod +x scripts/package_bundle.py
 
+# 1. Build a checksummed .tar.zst bundle into build/
+python3 scripts/package_bundle.py --source . --out build/workspace_bundle.tar.zst
+
+# 2. Verify the bundle's own SHA-256 sidecar from build/
+(cd build && sha256sum -c workspace_bundle.tar.zst.sha256)
+
+# 3. Run your master pipeline with custom workspace rules
+python3 scripts/local_workspace_audit.py \
+  --root . \
+  --manifest build/SHA256SUMS \
+  --require-path README.md \
+  --forbid-name .DS_Store
+bundle.py
+    parser.add_argument(
+        "--require-path",
+        action="append",
+        default=[],
+        help="Relative path that must exist under --root (repeatable)",
+    )
+    parser.add_argument(
+        "--forbid-name",
+        action="append",
+        default=[],
+        help="File or directory name forbidden under --root (repeatable)",
+    )
+# Add these helper checks inside audit_workspace(root, manifest, required_paths=(), forbidden_names=()):
+    root_resolved = root.resolve()
+
+    for req_rel in required_paths:
+        req_target = (root_resolved / req_rel).resolve()
+        if not req_target.exists():
+            errors.append(f"Missing required workspace path: {req_rel}")
+
+    if forbidden_names:
+        forbidden_set = set(forbidden_names)
+        ignored_dirs = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+        for path in root_resolved.rglob("*"):
+            if any(part in ignored_dirs for part in path.parts):
+                continue
+            if path.name in forbidden_set:
+                errors.append(f"Forbidden workspace item found: {path.relative_to(root_resolved)}")
+path.name
+path.name
+#!/usr/bin/env python3
+"""Create a deterministic tar.zst archive and companion SHA-256 checksum file."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+EXCLUDED_DIRS = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+
+
+def _reset_tarinfo(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    info.mtime = 0
+    if info.isdir():
+        info.mode = 0o755
+    elif info.isfile():
+        info.mode = 0o644
+    return info
+
+
+def build_deterministic_tar(source_dir: Path, tar_path: Path) -> None:
+    source_resolved = source_dir.resolve()
+    files_and_dirs: list[tuple[Path, str]] = []
+
+    for current_root, dirnames, filenames in os.walk(source_resolved):
+        dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDED_DIRS)
+        filenames.sort()
+
+        current_path = Path(current_root)
+        rel_root = current_path.relative_to(source_resolved)
+
+        if str(rel_root) != ".":
+            files_and_dirs.append((current_path, rel_root.as_posix()))
+
+        for fname in filenames:
+            full_file = current_path / fname
+            if full_file.is_symlink():
+                continue
+            arcname = fname if str(rel_root) == "." else f"{rel_root.as_posix()}/{fname}"
+            files_and_dirs.append((full_file, arcname))
+
+    with tarfile.open(tar_path, mode="w", format=tarfile.PAX_FORMAT) as tf:
+        for src_path, arcname in files_and_dirs:
+            tf.add(src_path, arcname=arcname, recursive=False, filter=_reset_tarinfo)
+
+
+def compress_zst(tar_path: Path, zst_path: Path, level: int = 3) -> None:
+    zst_path.parent.mkdir(parents=True, exist_ok=True)
+    with tar_path.open("rb") as src, zst_path.open("wb") as dst:
+        subprocess.run(
+            ["zstd", f"-{level}", "--force", "--stdout"],
+            stdin=src,
+            stdout=dst,
+            check=True,
+        )
+
+
+def write_sha256_sidecar(artifact_path: Path, checksum_path: Path) -> str:
+    h = hashlib.sha256()
+    with artifact_path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    checksum_path.write_text(f"{digest}  {artifact_path.name}\n", encoding="utf-8")
+    return digest
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Package deterministic tar.zst bundle + SHA-256.")
+    parser.add_argument("--source", required=True, help="Directory to archive")
+    parser.add_argument("--out", required=True, help="Output .tar.zst path")
+    parser.add_argument("--level", type=int, default=3, help="zstd compression level (1-19)")
+    args = parser.parse_args(argv)
+
+    source_dir = Path(args.source)
+    if not source_dir.is_dir():
+        print(f"[BUNDLE FAIL] Source directory not found: {source_dir}", file=sys.stderr)
+        return 1
+
+    zst_path = Path(args.out)
+    if not zst_path.name.endswith(".tar.zst"):
+        print(f"[BUNDLE FAIL] Output path must end with .tar.zst: {zst_path}", file=sys.stderr)
+        return 1
+
+    checksum_path = Path(f"{zst_path}.sha256")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_tar = Path(tmpdir) / "bundle.tar"
+            build_deterministic_tar(source_dir, raw_tar)
+            compress_zst(raw_tar, zst_path, level=args.level)
+        digest = write_sha256_sidecar(zst_path, checksum_path)
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
+        print(f"[BUNDLE FAIL] {exc}", file=sys.stderr)
+        return 1
+
+    print(f"[BUNDLE OK] archive={zst_path} sha256={digest} sidecar={checksum_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+bundle.pyREADME.mdpath.nametar.zst#!/usr/bin/env python3
+"""Create a deterministic tar.zst archive and companion SHA-256 checksum file."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+EXCLUDED_DIRS = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+
+
+def _reset_tarinfo(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    info.mtime = 0
+    if info.isdir():
+        info.mode = 0o755
+    elif info.isfile():
+        info.mode = 0o644
+    return info
+
+
+def build_deterministic_tar(source_dir: Path, tar_path: Path) -> None:
+    source_resolved = source_dir.resolve()
+    files_and_dirs: list[tuple[Path, str]] = []
+
+    for current_root, dirnames, filenames in os.walk(source_resolved):
+        dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDED_DIRS)
+        filenames.sort()
+
+        current_path = Path(current_root)
+        rel_root = current_path.relative_to(source_resolved)
+
+        if str(rel_root) != ".":
+            files_and_dirs.append((current_path, rel_root.as_posix()))
+
+        for fname in filenames:
+            full_file = current_path / fname
+            if full_file.is_symlink():
+                continue
+            arcname = fname if str(rel_root) == "." else f"{rel_root.as_posix()}/{fname}"
+            files_and_dirs.append((full_file, arcname))
+
+    with tarfile.open(tar_path, mode="w", format=tarfile.PAX_FORMAT) as tf:
+        for src_path, arcname in files_and_dirs:
+            tf.add(src_path, arcname=arcname, recursive=False, filter=_reset_tarinfo)
+
+
+def compress_zst(tar_path: Path, zst_path: Path, level: int = 3) -> None:
+    zst_path.parent.mkdir(parents=True, exist_ok=True)
+    with tar_path.open("rb") as src, zst_path.open("wb") as dst:
+        subprocess.run(
+            ["zstd", f"-{level}", "--force", "--stdout"],
+            stdin=src,
+            stdout=dst,
+            check=True,
+        )
+
+
+def write_sha256_sidecar(artifact_path: Path, checksum_path: Path) -> str:
+    h = hashlib.sha256()
+    with artifact_path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    checksum_path.write_text(f"{digest}  {artifact_path.name}\n", encoding="utf-8")
+    return digest
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Package deterministic tar.zst bundle + SHA-256.")
+    parser.add_argument("--source", required=True, help="Directory to archive")
+    parser.add_argument("--out", required=True, help="Output .tar.zst path")
+    parser.add_argument("--level", type=int, default=3, help="zstd compression level (1-19)")
+    args = parser.parse_args(argv)
+
+    source_dir = Path(args.source)
+    if not source_dir.is_dir():
+        print(f"[BUNDLE FAIL] Source directory not found: {source_dir}", file=sys.stderr)
+        return 1
+
+    zst_path = Path(args.out)
+    if not zst_path.name.endswith(".tar.zst"):
+        print(f"[BUNDLE FAIL] Output path must end with .tar.zst: {zst_path}", file=sys.stderr)
+        return 1
+
+    checksum_path = Path(f"{zst_path}.sha256")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_tar = Path(tmpdir) / "bundle.tar"
+            build_deterministic_tar(source_dir, raw_tar)
+            compress_zst(raw_tar, zst_path, level=args.level)
+        digest = write_sha256_sidecar(zst_path, checksum_path)
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
+        print(f"[BUNDLE FAIL] {exc}", file=sys.stderr)
+        return 1
+
+    print(f"[BUNDLE OK] archive={zst_path} sha256={digest} sidecar={checksum_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+# Add these helper checks inside audit_workspace(root, manifest, required_paths=(), forbidden_names=()):
+    root_resolved = root.resolve()
+
+    for req_rel in required_paths:
+        req_target = (root_resolved / req_rel).resolve()
+        if not req_target.exists():
+            errors.append(f"Missing required workspace path: {req_rel}")
+
+    if forbidden_names:
+        forbidden_set = set(forbidden_names)
+        ignored_dirs = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+        for path in root_resolved.rglob("*"):
+            if any(part in ignored_dirs for part in path.parts):
+                continue
+            if path.name in forbidden_set:
+                errors.append(f"Forbidden workspace item found: {path.relative_to(root_resolved)}")
+    parser.add_argument(
+        "--require-path",
+        action="append",
+        default=[],
+        help="Relative path that must exist under --root (repeatable)",
+    )
+    parser.add_argument(
+        "--forbid-name",
+        action="append",
+        default=[],
+        help="File or directory name forbidden under --root (repeatable)",
+    )
+chmod +x scripts/package_bundle.py
+
+# 1. Build a checksummed .tar.zst bundle into build/
+python3 scripts/package_bundle.py --source . --out build/workspace_bundle.tar.zst
+
+# 2. Verify the bundle's own SHA-256 sidecar from build/
+(cd build && sha256sum -c workspace_bundle.tar.zst.sha256)
+
+# 3. Run your master pipeline with custom workspace rules
+python3 scripts/local_workspace_audit.py \
+  --root . \
+  --manifest build/SHA256SUMS \
+  --require-path README.md \
+  --forbid-name .DS_Store
+Here is how to add deterministic tar.zst archive packaging with matching .sha256 manifests and customizable workspace rules (--forbid-name, --require-path) so your pipeline covers both artifact bundling and stricter repository checks.
+1. Packaging tar.zst Bundles with SHA-256 Checksums (scripts/package_bundle.py)
+This script packages a target directory into a deterministic .tar.zst archive (sorting entries, normalizing timestamps/permissions, and setting mtime=0 for reproducibility) and writes a companion <archive>.sha256 file.
+#!/usr/bin/env python3
+"""Create a deterministic tar.zst archive and companion SHA-256 checksum file."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+EXCLUDED_DIRS = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+
+
+def _reset_tarinfo(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    info.mtime = 0
+    if info.isdir():
+        info.mode = 0o755
+    elif info.isfile():
+        info.mode = 0o644
+    return info
+
+
+def build_deterministic_tar(source_dir: Path, tar_path: Path) -> None:
+    source_resolved = source_dir.resolve()
+    files_and_dirs: list[tuple[Path, str]] = []
+
+    for current_root, dirnames, filenames in os.walk(source_resolved):
+        dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDED_DIRS)
+        filenames.sort()
+
+        current_path = Path(current_root)
+        rel_root = current_path.relative_to(source_resolved)
+
+        if str(rel_root) != ".":
+            files_and_dirs.append((current_path, rel_root.as_posix()))
+
+        for fname in filenames:
+            full_file = current_path / fname
+            if full_file.is_symlink():
+                continue
+            arcname = fname if str(rel_root) == "." else f"{rel_root.as_posix()}/{fname}"
+            files_and_dirs.append((full_file, arcname))
+
+    with tarfile.open(tar_path, mode="w", format=tarfile.PAX_FORMAT) as tf:
+        for src_path, arcname in files_and_dirs:
+            tf.add(src_path, arcname=arcname, recursive=False, filter=_reset_tarinfo)
+
+
+def compress_zst(tar_path: Path, zst_path: Path, level: int = 3) -> None:
+    zst_path.parent.mkdir(parents=True, exist_ok=True)
+    with tar_path.open("rb") as src, zst_path.open("wb") as dst:
+        subprocess.run(
+            ["zstd", f"-{level}", "--force", "--stdout"],
+            stdin=src,
+            stdout=dst,
+            check=True,
+        )
+
+
+def write_sha256_sidecar(artifact_path: Path, checksum_path: Path) -> str:
+    h = hashlib.sha256()
+    with artifact_path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    checksum_path.write_text(f"{digest}  {artifact_path.name}\n", encoding="utf-8")
+    return digest
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Package deterministic tar.zst bundle + SHA-256.")
+    parser.add_argument("--source", required=True, help="Directory to archive")
+    parser.add_argument("--out", required=True, help="Output .tar.zst path")
+    parser.add_argument("--level", type=int, default=3, help="zstd compression level (1-19)")
+    args = parser.parse_args(argv)
+
+    source_dir = Path(args.source)
+    if not source_dir.is_dir():
+        print(f"[BUNDLE FAIL] Source directory not found: {source_dir}", file=sys.stderr)
+        return 1
+
+    zst_path = Path(args.out)
+    if not zst_path.name.endswith(".tar.zst"):
+        print(f"[BUNDLE FAIL] Output path must end with .tar.zst: {zst_path}", file=sys.stderr)
+        return 1
+
+    checksum_path = Path(f"{zst_path}.sha256")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_tar = Path(tmpdir) / "bundle.tar"
+            build_deterministic_tar(source_dir, raw_tar)
+            compress_zst(raw_tar, zst_path, level=args.level)
+        digest = write_sha256_sidecar(zst_path, checksum_path)
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
+        print(f"[BUNDLE FAIL] {exc}", file=sys.stderr)
+        return 1
+
+    print(f"[BUNDLE OK] archive={zst_path} sha256={digest} sidecar={checksum_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+2. Custom Rules in scripts/local_workspace_audit.py
+Update audit_workspace and main in scripts/local_workspace_audit.py so you can pass repeatable --require-path and --forbid-name flags from the CLI or wrapper script:
+# Add these helper checks inside audit_workspace(root, manifest, required_paths=(), forbidden_names=()):
+    root_resolved = root.resolve()
+
+    for req_rel in required_paths:
+        req_target = (root_resolved / req_rel).resolve()
+        if not req_target.exists():
+            errors.append(f"Missing required workspace path: {req_rel}")
+
+    if forbidden_names:
+        forbidden_set = set(forbidden_names)
+        ignored_dirs = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+        for path in root_resolved.rglob("*"):
+            if any(part in ignored_dirs for part in path.parts):
+                continue
+            if path.name in forbidden_set:
+                errors.append(f"Forbidden workspace item found: {path.relative_to(root_resolved)}")
+
+And in main:
+    parser.add_argument(
+        "--require-path",
+        action="append",
+        default=[],
+        help="Relative path that must exist under --root (repeatable)",
+    )
+    parser.add_argument(
+        "--forbid-name",
+        action="append",
+        default=[],
+        help="File or directory name forbidden under --root (repeatable)",
+    )
+
+3. Wiring Packaging & Verification Together
+chmod +x scripts/package_bundle.py
+
+# 1. Build a checksummed .tar.zst bundle into build/
+python3 scripts/package_bundle.py --source . --out build/workspace_bundle.tar.zst
+
+# 2. Verify the bundle's own SHA-256 sidecar from build/
+(cd build && sha256sum -c workspace_bundle.tar.zst.sha256)
+
+# 3. Run your master pipeline with custom workspace rules
+python3 scripts/local_workspace_audit.py \
+  --root . \
+  --manifest build/SHA256SUMS \
+  --require-path README.md \
+  --forbid-name .DS_Store
+
+Would you like to wire scripts/package_bundle.py directly into scripts/run_master_pipeline.sh behind an optional flag (like --bundle-out), or add tests for the new packaging and custom audit rules?
+guard.pyA practical "Master System & Pipeline" for a local-first engineering setup is a single, deterministic entry point that runs your validation checks, verifies SHA-256 integrity manifests, runs pytest, and records an auditable local log—without hidden network side effects or overclaimed automation. (This is general software engineering guidance, not legal or security advice.)
+1. Unified Local Master Runner (scripts/run_master_pipeline.sh)
+This shell script executes your workspace audit, clean pipeline/provenance guard, and pytest suite in order, writing a timestamped JSON-lines summary to a local log directory while failing closed (set -euo pipefail) if any check fails.
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="${1:-.}"
+MANIFEST_PATH="${2:-}"
+PROVENANCE_PATH="${3:-}"
+LOG_DIR="${PIPELINE_LOG_DIR:-${HOME}/.local/state/master_pipeline}"
+TIMESTAMP_UTC="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
+LOG_FILE="${LOG_DIR}/pipeline_runs.jsonl"
+
+mkdir -p "${LOG_DIR}"
+
+AUDIT_CMD=(python3 scripts/local_workspace_audit.py --root "${ROOT_DIR}")
+if [[ -n "${MANIFEST_PATH}" ]]; then
+  AUDIT_CMD+=(--manifest "${MANIFEST_PATH}")
+fi
+
+GUARD_CMD=(python3 scripts/clean_pipeline_guard.py --root "${ROOT_DIR}")
+if [[ -n "${PROVENANCE_PATH}" ]]; then
+  GUARD_CMD+=(--provenance "${PROVENANCE_PATH}")
+fi
+
+echo "[1/3] Running local workspace & manifest audit..."
+"${AUDIT_CMD[@]}"
+
+echo "[2/3] Running clean pipeline & provenance guard..."
+"${GUARD_CMD[@]}"
+
+echo "[3/3] Running pytest suite..."
+pytest -q
+
+printf '{"timestamp_utc":"%s","root":"%s","status":"PASSED"}\n' \
+  "${TIMESTAMP_UTC}" \
+  "$(cd "${ROOT_DIR}" && pwd)" >> "${LOG_FILE}"
+
+echo "Master pipeline passed. Logged to ${LOG_FILE}"
+
+2. How to Run & Verify It
+ * Make the script executable:
+   chmod +x scripts/run_master_pipeline.sh
+
+ * Run against your repository root (and optionally pass a SHA256SUMS manifest and provenance.json):
+   bash scripts/run_master_pipeline.sh . build/SHA256SUMS config/provenance.json
+
+ * Inspect the append-only run log:
+   tail -n 5 "${HOME}/.local/state/master_pipeline/pipeline_runs.jsonl"
+
+3. Guardrails for Multi-Stage & Cross-Repo Pipelines
+ * Explicit over implicit: Pass paths, remotes, and flags explicitly rather than relying on silent background changes or unverified external endpoints.
+ * Immutable, checksummed artifacts: Pair every archive or release bundle (such as tar.zst) with a sha256sum manifest and verify it before moving files to backup or mirror targets.
+ * Honest boundaries: Keep sensitive records, credentials, and real personal data out of Git repositories, and treat any simulated or synthetic outputs strictly as test artifacts.
+tail -n 5 "${HOME}/.local/state/master_pipeline/pipeline_runs.jsonl"
+bash scripts/run_master_pipeline.sh . build/SHA256SUMS config/provenance.json
+chmod +x scripts/run_master_pipeline.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="${1:-.}"
+MANIFEST_PATH="${2:-}"
+PROVENANCE_PATH="${3:-}"
+LOG_DIR="${PIPELINE_LOG_DIR:-${HOME}/.local/state/master_pipeline}"
+TIMESTAMP_UTC="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
+LOG_FILE="${LOG_DIR}/pipeline_runs.jsonl"
+
+mkdir -p "${LOG_DIR}"
+
+AUDIT_CMD=(python3 scripts/local_workspace_audit.py --root "${ROOT_DIR}")
+if [[ -n "${MANIFEST_PATH}" ]]; then
+  AUDIT_CMD+=(--manifest "${MANIFEST_PATH}")
+fi
+
+GUARD_CMD=(python3 scripts/clean_pipeline_guard.py --root "${ROOT_DIR}")
+if [[ -n "${PROVENANCE_PATH}" ]]; then
+  GUARD_CMD+=(--provenance "${PROVENANCE_PATH}")
+fi
+
+echo "[1/3] Running local workspace & manifest audit..."
+"${AUDIT_CMD[@]}"
+
+echo "[2/3] Running clean pipeline & provenance guard..."
+"${GUARD_CMD[@]}"
+
+echo "[3/3] Running pytest suite..."
+pytest -q
+
+printf '{"timestamp_utc":"%s","root":"%s","status":"PASSED"}\n' \
+  "${TIMESTAMP_UTC}" \
+  "$(cd "${ROOT_DIR}" && pwd)" >> "${LOG_FILE}"
+
+echo "Master pipeline passed. Logged to ${LOG_FILE}"
+provenance.jsonTo make your local repositories, automation pipelines, and AI workflows cleaner, safer, transparent, and aligned with good operational and compliance hygiene, add explicit secret/PII hygiene checks, honest data/AI provenance metadata, and fail-closed audit logging—while keeping all enforcement strictly local to files you authorize. (This is general software engineering guidance, not legal advice.)
+1. Clean Pipeline & Provenance Guard (scripts/clean_pipeline_guard.py)
+This script builds on your local audit workflow to:
+ * Scan non-ignored text/config files for accidental private keys, tokens, or SSN-like patterns before committing or bundling.
+ * Require and verify a clean provenance.json manifest (declaring whether data is synthetic/sanitized, local-only, and non-clinical/non-legal-advice) alongside SHA256SUMS.
+ * Output a clear, honest JSON report with deterministic exit codes (0 when clean, 1 when issues are found).
+#!/usr/bin/env python3
+"""Run local hygiene, provenance transparency, and SHA-256 integrity checks."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+from typing import Any
+
+SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv"}
+
+SENSITIVE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("private_key_block", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")),
+    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("github_classic_pat", re.compile(r"\bghp_[A-Za-z0-9]{36}\b")),
+    ("github_fine_pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b")),
+    ("ssn_like_pattern", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
+]
+
+REQUIRED_PROVENANCE_KEYS = {
+    "service_name",
+    "data_classification",
+    "local_only_processing",
+    "automated_external_actions",
+    "disclaimer",
+}
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def scan_for_secrets(root: Path) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or any(part in SKIP_DIRS for part in path.parts):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            for label, pattern in SENSITIVE_PATTERNS:
+                if pattern.search(line):
+                    findings.append(
+                        {
+                            "file": str(path.relative_to(root)),
+                            "line": line_no,
+                            "rule": label,
+                        }
+                    )
+    return findings
+
+
+def check_provenance(provenance_path: Path | None) -> dict[str, Any]:
+    if provenance_path is None:
+        return {"checked": False, "ok": True, "errors": []}
+    if not provenance_path.is_file():
+        return {"checked": True, "ok": False, "errors": [f"Missing provenance file: {provenance_path}"]}
+    try:
+        data = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"checked": True, "ok": False, "errors": [f"Invalid provenance JSON: {exc}"]}
+
+    errors: list[str] = []
+    if not isinstance(data, dict):
+        return {"checked": True, "ok": False, "errors": ["Provenance root must be a JSON object"]}
+
+    missing = sorted(REQUIRED_PROVENANCE_KEYS - set(data.keys()))
+    if missing:
+        errors.append(f"Missing required provenance fields: {', '.join(missing)}")
+
+    if "local_only_processing" in data and not isinstance(data["local_only_processing"], bool):
+        errors.append("Field 'local_only_processing' must be a boolean")
+
+    if "automated_external_actions" in data and data["automated_external_actions"] is not False:
+        errors.append("Field 'automated_external_actions' must be explicitly false for safe local runs")
+
+    return {"checked": True, "ok": len(errors) == 0, "errors": errors}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Clean, transparent local pipeline guard.")
+    parser.add_argument("--root", type=Path, default=Path("."), help="Workspace root to audit")
+    parser.add_argument("--provenance", type=Path, default=None, help="Optional provenance.json file")
+    args = parser.parse_args()
+
+    root = args.root.resolve()
+    provenance_path = args.provenance.resolve() if args.provenance else None
+
+    secret_findings = scan_for_secrets(root)
+    provenance_report = check_provenance(provenance_path)
+
+    passed = len(secret_findings) == 0 and provenance_report["ok"]
+    summary = {
+        "root": str(root),
+        "passed": passed,
+        "secret_or_pii_findings_count": len(secret_findings),
+        "secret_or_pii_findings": secret_findings,
+        "provenance": provenance_report,
+    }
+    print(json.dumps(summary, indent=2))
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+2. Core Principles for Clean, Honest, Lawful Pipelines
+ * Explicit boundaries over hidden automation: Keep scripts local-first, read-only where possible, and explicit about any outbound actions (automated_external_actions: false unless intentionally invoked). Never embed active credentials, private keys, or real personal identifiers in code or sample fixtures.
+ * Honest AI & telemetry reporting: Label synthetic test data and simulated states clearly, avoid fabricated metrics or overclaimed certainty, and log deterministic hashes (sha256sum) so results can be independently verified.
+ * Fair & lawful access practices: Only audit systems, directories, and accounts you own or are explicitly authorized to manage, and respect platform terms, privacy controls, and applicable laws.
+ * Professional release hygiene: Keep commits small and scoped, enforce signed commits/tags on protected branches, and run automated tests (pytest) before tagging releases.
+path.isargs.provenancefrom __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _run_audit(root: Path, manifest: Path | None = None) -> subprocess.CompletedProcess[str]:
+    cmd = [sys.executable, "scripts/local_workspace_audit.py", "--root", str(root)]
+    if manifest is not None:
+        cmd.extend(["--manifest", str(manifest)])
+    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+
+def test_valid_json_and_matching_manifest(tmp_path: Path) -> None:
+    sample_json = tmp_path / "config.json"
+    sample_json.write_text(json.dumps({"ok": True}), encoding="utf-8")
+
+    payload = b"evidence-content\n"
+    evidence_file = tmp_path / "item.txt"
+    evidence_file.write_bytes(payload)
+
+    manifest = tmp_path / "SHA256SUMS"
+    manifest.write_text(f"{_sha256_bytes(payload)}  item.txt\n", encoding="utf-8")
+
+    proc = _run_audit(tmp_path, manifest=manifest)
+    assert proc.returncode == 0
+
+    report = json.loads(proc.stdout)
+    assert report["passed"] is True
+    assert report["json_files_checked"] == 1
+    assert report["invalid_json_files"] == []
+    assert report["manifest_verification"]["ok"] is True
+    assert report["manifest_verification"]["checked_entries"] == 1
+
+
+def test_invalid_json_and_manifest_mismatch(tmp_path: Path) -> None:
+    bad_json = tmp_path / "broken.json"
+    bad_json.write_text("{not valid json", encoding="utf-8")
+
+    evidence_file = tmp_path / "item.txt"
+    evidence_file.write_bytes(b"original\n")
+
+    manifest = tmp_path / "SHA256SUMS"
+    manifest.write_text(f"{_sha256_bytes(b'original\n')}  item.txt\n", encoding="utf-8")
+
+    # Mutate file after manifest creation to trigger a hash mismatch
+    evidence_file.write_bytes(b"tampered\n")
+
+    proc = _run_audit(tmp_path, manifest=manifest)
+    assert proc.returncode == 1
+
+    report = json.loads(proc.stdout)
+    assert report["passed"] is False
+    assert len(report["invalid_json_files"]) == 1
+    assert report["invalid_json_files"][0]["file"].endswith("broken.json")
+    assert report["manifest_verification"]["ok"] is False
+    assert len(report["manifest_verification"]["issues"]) == 1
+#!/usr/bin/env python3
+"""Run local hygiene, provenance transparency, and SHA-256 integrity checks."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+from typing import Any
+
+SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv"}
+
+SENSITIVE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("private_key_block", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")),
+    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("github_classic_pat", re.compile(r"\bghp_[A-Za-z0-9]{36}\b")),
+    ("github_fine_pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b")),
+    ("ssn_like_pattern", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
+]
+
+REQUIRED_PROVENANCE_KEYS = {
+    "service_name",
+    "data_classification",
+    "local_only_processing",
+    "automated_external_actions",
+    "disclaimer",
+}
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def scan_for_secrets(root: Path) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or any(part in SKIP_DIRS for part in path.parts):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            for label, pattern in SENSITIVE_PATTERNS:
+                if pattern.search(line):
+                    findings.append(
+                        {
+                            "file": str(path.relative_to(root)),
+                            "line": line_no,
+                            "rule": label,
+                        }
+                    )
+    return findings
+
+
+def check_provenance(provenance_path: Path | None) -> dict[str, Any]:
+    if provenance_path is None:
+        return {"checked": False, "ok": True, "errors": []}
+    if not provenance_path.is_file():
+        return {"checked": True, "ok": False, "errors": [f"Missing provenance file: {provenance_path}"]}
+    try:
+        data = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"checked": True, "ok": False, "errors": [f"Invalid provenance JSON: {exc}"]}
+
+    errors: list[str] = []
+    if not isinstance(data, dict):
+        return {"checked": True, "ok": False, "errors": ["Provenance root must be a JSON object"]}
+
+    missing = sorted(REQUIRED_PROVENANCE_KEYS - set(data.keys()))
+    if missing:
+        errors.append(f"Missing required provenance fields: {', '.join(missing)}")
+
+    if "local_only_processing" in data and not isinstance(data["local_only_processing"], bool):
+        errors.append("Field 'local_only_processing' must be a boolean")
+
+    if "automated_external_actions" in data and data["automated_external_actions"] is not False:
+        errors.append("Field 'automated_external_actions' must be explicitly false for safe local runs")
+
+    return {"checked": True, "ok": len(errors) == 0, "errors": errors}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Clean, transparent local pipeline guard.")
+    parser.add_argument("--root", type=Path, default=Path("."), help="Workspace root to audit")
+    parser.add_argument("--provenance", type=Path, default=None, help="Optional provenance.json file")
+    args = parser.parse_args()
+
+    root = args.root.resolve()
+    provenance_path = args.provenance.resolve() if args.provenance else None
+
+    secret_findings = scan_for_secrets(root)
+    provenance_report = check_provenance(provenance_path)
+
+    passed = len(secret_findings) == 0 and provenance_report["ok"]
+    summary = {
+        "root": str(root),
+        "passed": passed,
+        "secret_or_pii_findings_count": len(secret_findings),
+        "secret_or_pii_findings": secret_findings,
+        "provenance": provenance_report,
+    }
+    print(json.dumps(summary, indent=2))
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+Make everything more legally and safely and security and the cleanest AI and safest and most honest and fair and lawful and professional services and pipelinespytest -v tests/test_local_workspace_audit.py
+How do I revoke an app's access to Liberty Federal Credit Union through Plaid or online banking?Your Plaid verification code is: 887576. Do NOT share it with anyone. Plaid will never call you to ask for this code.same tim(
+  cd /mnt/vault/evidence
+  sha256sum -c /mnt/vault/manifests/manifest_2026-11-20T16-46-00Z.sha256
+)To safely remove an accidental secret or sensitive file from Git history, treat the exposed credential as compromised—**rotate it immediately**, rewrite history cleanly on a dedicated/backed-up local copy, force-push carefully, and require collaborators or local clones to re-sync rather than merge old commits. *(This is general information, not legal or security advice.)*
+
+### 1. Rotate Exposed Credentials & Audit Access First
+
+* **Revoke or rotate immediately:** Do not wait for history rewriting to finish. Revoke/rotate any exposed API key, PAT, SSH/GPG key, password, token, or account credential in its provider console, and check audit/access logs for unexpected use.
+* **Verify:** Confirm the old secret/key is rejected by the provider or service and generate a fresh credential stored outside the repo (such as in a password manager, encrypted vault, or CI/CD secret store).
+
+### 2. Back Up & Rewrite Git History Cleanly
+
+* **Work on a fresh backup clone:** Make an offline/local backup copy of your repository first in case anything goes wrong during rewriting.
+* **Use a history-rewriting tool (`git-filter-repo`):** Prefer `git filter-repo` over `git filter-branch` for removing files or matching text patterns across commits:
+* Remove a file across all history: `git filter-repo --path path/to/secret-file --invert-paths`
+* Or replace a specific string/secret pattern across history using a expressions file: `git filter-repo --replace-text expressions.txt`
+
+
+* **Verify:** Run `git log --all -- path/to/secret-file` (or search history for the string/pattern) to confirm it no longer appears in reachable commits.
+
+### 3. Force-Push, Clean Local Refs & Prevent Re-Introduction
+
+* **Push rewritten history and expire old objects:** Coordinate with any collaborators, push the rewritten branches/tags (`git push --force --all` and `git push --force --tags`), and prune unreachable local objects:
+* `git reflog expire --expire=now --all && git gc --prune=now --aggressive`
+
+
+* **Warn collaborators / old clones:** Anyone who pulled the old history should clone fresh or hard-reset to the rewritten branch rather than merging old commits (which can bring the secret back).
+* **Add `.gitignore` and guardrails:** Add the file or pattern to `.gitignore` and keep secret scanning/push protection enabled on the remote repository.
+* **Verify:** Check a fresh clone of the remote repository and verify the removed file/secret is absent and new commits are blocked if a test secret is pushed.To automate SHA-256 hash manifests and timestamped logs for local backup and evidence files, run a deterministic script on a schedule (via `cron`, `systemd` timers, or Task Scheduler) that writes an immutable/append-only audit log and a per-run manifest inside an **encrypted local storage location**—while keeping any Git repository strictly limited to sanitized, non-sensitive code or templates. *(Hashes verify integrity and exact byte content; pair them with dated records and external receipts for broader evidentiary context.)*
+
+### 1. Generate SHA-256 Manifests & Timestamped Logs
+
+Use a script that walks your local backup/evidence directory in sorted order (excluding the manifest/log output files themselves so hashes do not self-invalidate), computes SHA-256 digests, writes a timestamped manifest file, and appends a summary entry to a running log.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+SRC_DIR="${1:-/mnt/vault/evidence}"
+OUT_DIR="${2:-/mnt/vault/manifests}"
+TIMESTAMP_UTC="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
+RUN_DATE="$(date -u +"%Y-%m-%d")"
+MANIFEST_PATH="${OUT_DIR}/manifest_${TIMESTAMP_UTC}.sha256"
+LOG_PATH="${OUT_DIR}/audit_log_${RUN_DATE}.jsonl"
+
+mkdir -p "${OUT_DIR}"
+
+# Generate deterministic SHA-256 manifest sorted by relative path
+(
+  cd "${SRC_DIR}"
+  find . -type f ! -path './.git/*' -print0 \
+    | LC_ALL=C sort -z \
+    | xargs -0 sha256sum
+) > "${MANIFEST_PATH}"
+
+FILE_COUNT="$(wc -l < "${MANIFEST_PATH}" | tr -d ' ')"
+MANIFEST_HASH="$(sha256sum "${MANIFEST_PATH}" | awk '{print $1}')"
+
+# Append structured JSON-lines entry to daily audit log
+printf '{"timestamp_utc":"%s","source_dir":"%s","manifest_file":"%s","manifest_sha256":"%s","file_count":%s}\n' \
+  "${TIMESTAMP_UTC}" \
+  "${SRC_DIR}" \
+  "$(basename "${MANIFEST_PATH}")" \
+  "${MANIFEST_HASH}" \
+  "${FILE_COUNT}" >> "${LOG_PATH}"
+
+echo "Wrote ${MANIFEST_PATH} (${FILE_COUNT} files) and logged to ${LOG_PATH}"
+
+```
+
+* **Verification:** Run the script manually on a test folder and confirm `manifest_<timestamp>.sha256` lists every file with its 64-character hex digest and `audit_log_<date>.jsonl` appends a new line with matching `file_count` and `manifest_sha256`.
+
+### 2. Verify Integrity Later
+
+To verify that files in your local archive have not been altered or corrupted since a manifest was generated:
+
+```bash
+(
+  cd /mnt/vault/evidence
+  sha256sum -c /mnt/vault/manifests/manifest_2026-11-20T16-46-00Z.sha256
+)
+
+```
+
+* **Verification:** Every file reports `: OK`, and `sha256sum -c` exits with status `0`. If a file changed or is missing, `sha256sum -c` reports `FAILED` with a non-zero exit code.
+
+### 3. Automate & Protect the Audit Trail
+
+* **Schedule locally:** Trigger the script on a recurring schedule using a `systemd` user/system timer or `cron` (for example, `0 2 * * * /usr/local/bin/make_manifest.sh /mnt/vault/evidence /mnt/vault/manifests`).
+* **Keep raw sensitive files & manifests in encrypted storage:** Store evidence files, raw exports, statements, and manifests inside encrypted local volumes/vaults—never push raw personal records or sensitive identifiers into a Git repository.
+* **Harden against accidental alteration:** Restrict write permissions on archived manifests/logs, consider append-only controls where supported on your filesystem/backup target, and keep an off-site encrypted copy.
+* *Verification:* Check `systemctl list-timers` or `crontab -l` to confirm the schedule is active, and verify permissions on the output directory so routine edits do not overwrite historical manifests.Here is a practical checklist for auditing your **SSH/GPG keys**, **OAuth tokens and access credentials**, and **hardware MFA** across accounts, organized so you can spot stale access, tighten scopes, and keep recovery material independent of any single account or repository.
+
+### 1. SSH & GPG Keys Audit
+
+* **Enumerate local and remote keys:** List loaded SSH keys (`ssh-add -l`) and key files in `~/.ssh`, inspect secret and public GPG keys (`gpg --list-secret-keys --keyid-format LONG` and `gpg --list-keys --keyid-format LONG`), and cross-check every fingerprint/key ID against your GitHub accounts, servers, and deployment targets.
+* **Prune legacy, duplicate, or unverified keys:** Remove keys tied to retired machines, old handles, or unclear purposes from both your local keyring and remote accounts. Keep modern keys (such as `ed25519` or hardware-backed FIDO2/SSH keys) protected with strong passphrases.
+* **Verify expiration dates and signing workflows:** Check GPG key expiration dates and subkeys, confirm commit and tag signing works locally (`git log --show-signature -n 3`), and verify that GitHub shows signed commits as **Verified** without relying on unreviewed keys.
+
+### 2. OAuth Tokens, PATs & Connected Apps Audit
+
+* **Review connected third-party apps and integrations:** Check authorized OAuth applications, GitHub App installations, connected cloud/email permissions, and financial or data-sharing links (such as Plaid or payment/investment apps). Revoke anything stale, unfamiliar, or granted broader access than needed.
+* **Audit Personal Access Tokens (PATs), deploy keys, and webhooks:** Review active PATs, SSH deploy keys, and repository/org webhooks—delete unused or expired entries, enforce expiration dates and least-privilege scopes on active ones, and rotate any token that may have been exposed.
+* **Keep secrets out of code and sync pipelines:** Store active tokens, API keys, and credentials inside your encrypted password manager or CI/CD secret store—never commit them to Git repositories or leave raw copies in unencrypted folders.
+
+### 3. Hardware MFA & Recovery Hygiene
+
+* **Confirm hardware keys and passkeys on high-value accounts:** Verify that hardware security keys (FIDO2/WebAuthn) and passkeys are enrolled on critical accounts—including primary email, password manager, GitHub, and financial/cloud accounts—and keep a **backup hardware key** enrolled so losing one key does not lock you out.
+* **Check active sessions and fallback MFA methods:** Review **Active sessions / Devices / Sign-in history** across key accounts, sign out of unrecognized or old sessions, and review fallback authentication methods so weaker options do not undermine strong MFA.
+* **Keep recovery codes and vault backups separate:** Store single-use 2FA recovery codes and encrypted vault backups in a hardware-encrypted local vault or secure physical location—never inside the account they protect or in shared/public repositories.gpg --list-secret-keys --keyid-format=longgit config --global --unset gpg.format
+git config --global user.signingkey YOUR_LONG_KEY_IDgit config --global commit.gpgsign true
+git config --global tag.gpgSign truegit config --global commit.gpgsign true
+git config --global tag.gpgSign trueTo set up and enforce signed commits across Git and GitHub, configure a signing key (SSH or GPG) locally, register its public key on your GitHub account as a signing key, enable automatic signing in Git, and require signed commits on your protected branches or rulesets.
+
+### 1. Set Up Your Signing Key & Git Configuration
+
+Git supports commit and tag signing with **SSH** (available in Git 2.34+) and **GPG** (OpenPGP).
+
+* **Option A — SSH Signing Key (recommended for modern setups):**
+1. Generate a dedicated signing key or reuse an existing `ed25519` key (for example, `ssh-keygen -t ed25519 -C "your-email@example.com" -f ~/.ssh/id_ed25519_signing`).
+2. Configure Git to sign with SSH and point `user.signingkey` to your public key file:
+```bash
+git config --global gpg.format ssh
+git config --global user.signingkey ~/.ssh/id_ed25519_signing.pub
+
+```
+
+
+3. On GitHub, go to **Settings** → **SSH and GPG keys** → **New SSH key**, set the **Key type** to **Signing Key**, and paste the contents of your `.pub` file.
+
+
+* **Option B — GPG Signing Key:**
+1. List your secret GPG keys and copy the long key ID:
+```bash
+gpg --list-secret-keys --keyid-format=long
+
+```
+
+
+2. Configure Git to use OpenPGP and your key ID:
+```bash
+git config --global --unset gpg.format
+git config --global user.signingkey YOUR_LONG_KEY_ID
+
+```
+
+
+3. Export your public key (`gpg --armor --export YOUR_LONG_KEY_ID`) and add it under **Settings** → **SSH and GPG keys** → **New GPG key** on GitHub.
+
+
+* **Enable Automatic Signing & Verify Locally:**
+```bash
+git config --global commit.gpgsign true
+git config --global tag.gpgSign true
+
+```
+
+
+Make a test commit and check the signature locally with `git log --show-signature -n 1`, then push it to GitHub and confirm the commit displays a **Verified** badge. *(Make sure the commit author email matches a verified email address on your GitHub account.)*
+
+### 2. Enforce Signed Commits on GitHub
+
+Enabling `commit.gpgsign` locally only signs commits from machines where you set it—to enforce verification on the repository side, require signed commits on your target branches:
+
+1. Open your repository on GitHub and go to **Settings** → **Rules** → **Rulesets** (or **Settings** → **Branches** for classic branch protection rules).
+2. Select or create a rule/ruleset targeting your protected branch (such as `main`), and enable **Require signed commits**.
+3. Save the changes and pair this with complementary branch safeguards—such as blocking force pushes, requiring pull requests/reviews, and enforcing least-privilege workflow permissions—so unsigned commits or unverified merges are rejected.
+* *Verification:* Push an unsigned test commit to a branch covered by the rule/ruleset (or attempt to merge an unsigned commit into a protected branch) and confirm GitHub rejects it.dail(
+  cd /mnt/vault/evidence
+  sha256sum -c /mnt/vault/manifests/manifest_2026-11-20T16-51-00Z.sha256
+)#!/usr/bin/env bash
+set -euo pipefail
+
+SRC_DIR="${1:-/mnt/vault/evidence}"
+OUT_DIR="${2:-/mnt/vault/manifests}"
+TIMESTAMP_UTC="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
+RUN_DATE="$(date -u +"%Y-%m-%d")"
+MANIFEST_PATH="${OUT_DIR}/manifest_${TIMESTAMP_UTC}.sha256"
+LOG_PATH="${OUT_DIR}/audit_log_${RUN_DATE}.jsonl"
+
+mkdir -p "${OUT_DIR}"
+
+# Generate deterministic SHA-256 manifest sorted by relative path
+(
+  cd "${SRC_DIR}"
+  find . -type f ! -path './.git/*' -print0 \
+    | LC_ALL=C sort -z \
+    | xargs -0 sha256sum
+) > "${MANIFEST_PATH}"
+
+FILE_COUNT="$(wc -l < "${MANIFEST_PATH}" | tr -d ' ')"
+MANIFEST_HASH="$(sha256sum "${MANIFEST_PATH}" | awk '{print $1}')"
+
+# Append structured JSON-lines entry to daily audit log
+printf '{"timestamp_utc":"%s","source_dir":"%s","manifest_file":"%s","manifest_sha256":"%s","file_count":%s}\n' \
+  "${TIMESTAMP_UTC}" \
+  "${SRC_DIR}" \
+  "$(basename "${MANIFEST_PATH}")" \
+  "${MANIFEST_HASH}" \
+  "${FILE_COUNT}" >> "${LOG_PATH}"
+
+echo "Wrote ${MANIFEST_PATH} (${FILE_COUNT} files) and logged to ${LOG_PATH}"Skip to main contentAccessibility help
+name: Sanitized Repository Integrity Check on: push: branches: - main pull_request: branches: - main schedule: - cron: '0 6 * * 1' # Weekly UTC check on Mondays workflow_dispatch: # Least-privilege default: read-only repository contents, no write scopes permissions: contents: read concurrency: group: sanitized-integrity-${{ github.ref }} cancel-in-progress: true jobs: verify-sanitized-repo: runs-on: ubuntu-latest timeout-minutes: 10 steps: - name: Checkout repository uses: actions/checkout@REPLACE_WITH_FULL_COMMIT_SHA_FOR_CHECKOUT # pin to audited commit SHA with: persist-credentials: false - name: Set up Python uses: actions/setup-python@REPLACE_WITH_FULL_COMMIT_SHA_FOR_SETUP_PYTHON # pin to audited commit SHA with: python-version: '3.12' - name: Verify non-sensitive template files and basic hygiene shell: bash run: | set -euo pipefail test -f README.md python - <<'PY' import pathlib import re root = pathlib.Path(".") blocked_patterns = [ re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"), re.compile(r"\bAKIA[0-9A-Z]{16}\b"), re.compile(r"\bghp_[A-Za-z0-9]{36}\b"), re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b"), re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), ] findings = [] for path in sorted(root.rglob("*")): if not path.is_file(): continue if ".git" in path.parts: continue try: content = path.read_text(encoding="utf-8") except UnicodeDecodeError: continue for idx, line in enumerate(content.splitlines(), start=1): for pat in blocked_patterns: if pat.search(line): findings.append(f"{path}:{idx}: matched {pat.pattern}") if findings: print("Potential secret or sensitive pattern detected in tracked/non-ignored files:") for item in findings: print(" -", item) raise SystemExit(1) print("Sanitized repository integrity check passed.") PY
+
+AI Mode
+All
+Forums
+Shopping
+Images
+Videos
+News
+More
+Tools
+Workflow syntax for GitHub Actions
+
+GitHub Docs
+https://docs.github.com › actions › using-workflows
+A workflow is a configurable automated process made up of one or more jobs. You must create a YAML file to define your workflow configuration.
+Missing: Integrity ‎privilege
+People also ask
+Why can't I enable actions for this repository?
+What are the default permissions for GitHub Actions?
+How can I use repository Dispatch in GitHub Actions?
+How can I manually trigger GitHub Actions?
+Securing GitHub Actions Workflows With Least-Privilege ...
+
+C# Corner
+https://www.c-sharpcorner.com › Technologies › DevOps
+Nov 10, 2026 — Learn how to apply least-privilege GITHUB_TOKEN permissions in GitHub Actions workflows, including workflow- and job-level scopes for builds ...
+Missing: Sanitized ‎Integrity ‎cron: ‎6 * * ‎UTC ‎+1
+Events that trigger workflows
+
+GitHub Docs
+https://docs.github.com › actions › using-workflows › e...
+You can configure your workflows to run when specific activity on GitHub happens, at a scheduled time, or when an event outside of GitHub occurs.
+Missing: Sanitized ‎Integrity ‎scopes
+Managing GitHub Actions settings for a repository
+
+GitHub Docs
+https://docs.github.com › repositories › managing-githu...
+You can disable or configure GitHub Actions for a specific repository. Configuring the retention period for checks, workflow runs, commit statuses, artifacts, ...
+Missing: Sanitized ‎Integrity ‎cron: ‎'0 ‎6 * * ‎UTC ‎+3
+Mastering GitHub Actions Workflows | PDF
+
+Scribd
+https://www.scribd.com › document › Git-Hub-Notes
+The guide covers creating workflows, triggering them through various events, using runners, and writing custom actions, providing a comprehensive understanding ...Read more
+Configuration Cheat Sheet
+
+Forgejo
+https://forgejo.org › v15.0 › admin › config-cheat-sheet
+This is a cheat sheet for the Forgejo configuration file. It contains most of the settings that can be configured as well as their default values.
+GitHub Actions | AgriCommons Foundation
+
+agricommons.org
+https://agricommons.org › github-actions
+GitHub Actions transforms your rules into code. Every push and pull request becomes an opportunity to check structure, test logic, and protect quality ...
+Scheduled and maintenance workflows
+
+OpenClaw Docs
+https://docs.openclaw.ai › scheduled-workflows
+Sanity checks tracked conflict markers on every admitted push. GitHub cron is best-effort on the default branch, not a one-hour latency SLA: runs may be ...
+Bot bypass identity - Shaken Fist
+
+shakenfist.com
+https://shakenfist.com › development › plans › PLAN-bo...
+Seven default-branch rulesets require a pull request, status checks and the merge queue, and every one of them names the same bypass actor, the team sf-can-skip ...Read more
+Execution
+Phase 1: Operator Inventory...
+211 Entries (~1147 And...
+People also search for
+GitHub Actions permissions
+Workflow_dispatch: inputs
+Workflow_dispatch GitHub Actions
+Github actions/checkout
+Workflow_call vs workflow_dispatch
+GitHub event_name values
+GitHub Actions get branch name
+GitHub workflow permissions list
+1	
+2
+3
+4
+5
+6
+Next
+Results are personalized
+-
+Try without personalization
+Cedar Hall, Evansville, IN - Based on your places (Home)
+ - Update location
+Help
+Send feedback
+Privacy
+TermsTo automate SHA-256 hash manifests and timestamped logs for local backup and evidence files, run a deterministic script on a schedule (via `cron`, `systemd` timers, or Task Scheduler) that writes per-run manifests and an append-only log inside an **encrypted local storage location**—while keeping any Git repository strictly limited to sanitized, non-sensitive code or templates. *(Hashes verify integrity and exact byte content; pair them with dated records and external receipts for broader evidentiary context.)*
+
+### 1. Generate SHA-256 Manifests & Timestamped Logs
+
+Use a script that walks your local backup/evidence directory in sorted order (excluding the manifest/log output files themselves so hashes do not self-invalidate), computes SHA-256 digests, writes a timestamped manifest file, and appends a summary entry to a running log.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+SRC_DIR="${1:-/mnt/vault/evidence}"
+OUT_DIR="${2:-/mnt/vault/manifests}"
+TIMESTAMP_UTC="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
+RUN_DATE="$(date -u +"%Y-%m-%d")"
+MANIFEST_PATH="${OUT_DIR}/manifest_${TIMESTAMP_UTC}.sha256"
+LOG_PATH="${OUT_DIR}/audit_log_${RUN_DATE}.jsonl"
+
+mkdir -p "${OUT_DIR}"
+
+# Generate deterministic SHA-256 manifest sorted by relative path
+(
+  cd "${SRC_DIR}"
+  find . -type f ! -path './.git/*' -print0 \
+    | LC_ALL=C sort -z \
+    | x#!/usr/bin/env python3
+"""Audit a local project directory for JSON syntax and SHA-256 manifest integrity."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import sys
+from typing import Any
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def check_json_files(root: Path) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for path in sorted(root.rglob("*.json")):
+        if ".git" in path.parts or "__pycache__" in path.parts:
+            continue
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+            results.append({"file": str(path), "valid": True, "error": None})
+        except Exception as exc:
+            results.append({"file": str(path), "valid": False, "error": str(exc)})
+    return results
+
+
+def verify_manifest(manifest_path: Path, base_dir: Path) -> dict[str, Any]:
+    mismatches: list[str] = []
+    checked = 0
+    for raw_line in manifest_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            mismatches.append(f"Malformed manifest line: {line}")
+            continue
+        expected_hash, rel_name = parts[0].lower(), parts[1].lstrip("*").strip()
+        target = (base_dir / rel_name).resolve()
+        checked += 1
+        if not target.is_file():
+            mismatches.append(f"Missing file: {rel_name}")
+            continue
+        actual_hash = sha256_file(target)
+        if actual_hash != expected_hash:
+            mismatches.append(f"Hash mismatch for {rel_name}: expected {expected_hash}, got {actual_hash}")
+
+    return {
+        "manifest": str(manifest_path),
+        "checked_entries": checked,
+        "ok": len(mismatches) == 0,
+        "issues": mismatches,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Local-only JSON and SHA-256 manifest audit.")
+    parser.add_argument("--root", type=Path, default=Path("."), help="Workspace root directory")
+    parser.add_argument("--manifest", type=Path, default=None, help="Optional SHA256SUMS manifest file")
+    args = parser.parse_args()
+
+    root = args.root.resolve()
+    json_checks = check_json_files(root)
+    invalid_json = [item for item in json_checks if not item["valid"]]
+
+    manifest_report: dict[str, Any] | None = None
+    if args.manifest is not None:
+        manifest_report = verify_manifest(args.manifest.resolve(), root)
+
+    summary = {
+        "root": str(root),
+        "json_files_checked": len(json_checks),
+        "invalid_json_files": invalid_json,
+        "manifest_verification": manifest_report,
+        "passed": len(invalid_json) == 0 and (manifest_report is None or manifest_report["ok"]),
+    }
+    print(json.dumps(summary, indent=2))
+    return 0 if summary["passed"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+Https://gemini.google.com/share/313a457113db?social_preview=true&skid=162e4c32-fad2-4648-8b19-3c7ad418d91b
+Find everything that is rightfully mine full Jason blueprint timeline pipelines GitHub accounts Google accounts and apps and email accounts and passwords and devices key's and IP and VPN addresses worldwideHttps://gemini.google.com/share/313a457113db?social_preview=true&skid=162e4c32-fad2-4648-8b19-3c7ad418d91b# A. Legal compendium unit tests, SHA-256 manifest, and evidence ingestion
+python3 -m unittest -v test_legal_compendium.py
+sha256sum /mnt/vault/evidence/audit-20261122-play/* > /mnt/vault/evidence/audit-20261122-play/SHA256SUMS.txt
+python3 ingest_evidence.py AUDIT-20261122-PLAY /mnt/vault/evidence/audit-20261122-play
+
+# B. Host firewall isolation during key/recovery work (UFW)
+sudo ufw default deny incoming
+sudo ufw default deny outgoing
+sudo ufw allow in on lo
+sudo ufw allow out on lo
+sudo ufw allow out 443/tcp
+sudo ufw enable
+
+# C. Import offline GPG private key & decrypt/extract a recovery archive locally
+gpg --import /path/to/offline/private.key
+gpg --decrypt recovery_archive.tar.zst.gpg | zstd -d | tar -xvf - -C /target/recovery/
+1robertevans471@gmail.comingest_evidence.pytest_legal_compendium.py3. Next Steps
+(Reference and organization notes only—not legal advice; consult a licensed attorney for advice on specific legal claims or remedies.)
+If you want to work on a specific part of this next, let me know whether you prefer to:
+1. Map out your offline emergency code / passkey storage layout under MASTER RECOVERY VAULT/Security,  
+2. Review or refine your ingest_evidence.py / compendium.sqlite schema for AUDIT-20261122-PLAY, or
+3. Add a scheduled security/recovery audit date on your Google Calendar.recovery_archive.tar.zst.gpgcompendium.sqliteYes everything all master codes 
+# 1. Run unit tests on your legal compendium tooling
+python3 -m unittest -v test_legal_compendium.py
+
+# 2. Generate a SHA-256 manifest inside your vault folder before ingestion
+sha256sum /mnt/vault/evidence/audit-20261122-play/* > /mnt/vault/evidence/audit-20261122-play/SHA256SUMS.txt
+
+# 3. Ingest the evidence bundle into compendium.sqlite
+python3 ingest_evidence.py AUDIT-20261122-PLAY /mnt/vault/evidence/audit-20261122-play
+# 1. Host egress isolation during key/recovery work (UFW)
+sudo ufw default deny incoming
+sudo ufw default deny outgoing
+sudo ufw allow in on lo
+sudo ufw allow out on lo
+sudo ufw allow out 443/tcp
+sudo ufw enable
+
+# 2. Import offline GPG private key & decrypt/extract a recovery archive locally
+gpg --import /path/to/offline/private.key
+gpg --decrypt recovery_archive.tar.zst.gpg | zstd -d | tar -xvf - -C /target/recovery/
+.
+# A. Legal compendium unit tests, SHA-256 manifest, and evidence ingestion
+python3 -m unittest -v test_legal_compendium.py
+sha256sum /mnt/vault/evidence/audit-20261122-play/* > /mnt/vault/evidence/audit-20261122-play/SHA256SUMS.txt
+python3 ingest_evidence.py AUDIT-20261122-PLAY /mnt/vault/evidence/audit-20261122-play
+
+# B. Host firewall isolation during key/recovery work (UFW)
+sudo ufw default deny incoming
+sudo ufw default deny outgoing
+sudo ufw allow in on lo
+sudo ufw allow out on lo
+sudo ufw allow out 443/tcp
+sudo ufw enable
+
+# C. Import offline GPG private key & decrypt/extract a recovery archive locally
+gpg --import /path/to/offline/private.key
+gpg --decrypt recovery_archive.tar.zst.gpg | zstd -d | tar -xvf - -C /target/recovery/
+# A. Legal compendium unit tests, SHA-256 manifest, and evidence ingestion
+python3 -m unittest -v test_legal_compendium.py
+sha256sum /mnt/vault/evidence/audit-20261122-play/* > /mnt/vault/evidence/audit-20261122-play/SHA256SUMS.txt
+python3 ingest_evidence.py AUDIT-20261122-PLAY /mnt/vault/evidence/audit-20261122-play
+
+# B. Host firewall isolation during key/recovery work (UFW)
+sudo ufw default deny incoming
+sudo ufw default deny outgoing
+sudo ufw allow in on lo
+sudo ufw allow out on lo
+sudo ufw allow out 443/tcp
+sudo ufw enable
+
+# C. Import offline GPG private key & decrypt/extract a recovery archive locally
+gpg --import /path/to/offline/private.key
+gpg --decrypt recovery_archive.tar.zst.gpg | zstd -d | tar -xvf - -C /target/recovery/
+# A. Legal compendium unit tests, SHA-256 manifest, and evidence ingestion
+python3 -m unittest -v test_legal_compendium.py
+sha256sum /mnt/vault/evidence/audit-20261122-play/* > /mnt/vault/evidence/audit-20261122-play/SHA256SUMS.txt
+python3 ingest_evidence.py AUDIT-20261122-PLAY /mnt/vault/evidence/audit-20261122-play
+
+# B. Host firewall isolation during key/recovery work (UFW)
+sudo ufw default deny incoming
+sudo ufw default deny outgoing
+sudo ufw allow in on lo
+sudo ufw allow out on lo
+sudo ufw allow out 443/tcp
+sudo ufw enable
+
+# C. Import offline GPG private key & decrypt/extract a recovery archive locally
+gpg --import /path/to/offline/private.key
+gpg --decrypt recovery_archive.tar.zst.gpg | zstd -d | tar -xvf - -C /target/recovery/
+
+3. Next Steps
+(Reference and organization notes only—not legal advice; consult a licensed attorney for advice on specific legal claims or remedies.)
+If you want to work on a specific part of this next, let me know whether you prefer to:
+1. Map out your offline emergency code / passkey storage layout under MASTER RECOVERY VAULT/Security,  
+2. Review or refine your ingest_evidence.py / compendium.sqlite schema for AUDIT-20261122-PLAY, or
+3. Add a scheduled security/recovery audit date on your Google Calendar.Yes everything all master codes 
+# 1. Run unit tests on your legal compendium tooling
+python3 -m unittest -v test_legal_compendium.py
+
+# 2. Generate a SHA-256 manifest inside your vault folder before ingestion
+sha256sum /mnt/vault/evidence/audit-20261122-play/* > /mnt/vault/evidence/audit-20261122-play/SHA256SUMS.txt
+
+# 3. Ingest the evidence bundle into compendium.sqlite
+python3 ingest_evidence.py AUDIT-20261122-PLAY /mnt/vault/evidence/audit-20261122-play
+# 1. Host egress isolation during key/recovery work (UFW)
+sudo ufw default deny incoming
+sudo ufw default deny outgoing
+sudo ufw allow in on lo
+sudo ufw allow out on lo
+sudo ufw allow out 443/tcp
+sudo ufw enable
+
+# 2. Import offline GPG private key & decrypt/extract a recovery archive locally
+gpg --import /path/to/offline/private.key
+gpg --decrypt recovery_archive.tar.zst.gpg | zstd -d | tar -xvf - -C /target/recovery/
+.Yes everything all master codes 
+# 1. Run unit tests on your legal compendium tooling
+python3 -m unittest -v test_legal_compendium.py
+
+# 2. Generate a SHA-256 manifest inside your vault folder before ingestion
+sha256sum /mnt/vault/evidence/audit-20261122-play/* > /mnt/vault/evidence/audit-20261122-play/SHA256SUMS.txt
+
+# 3. Ingest the evidence bundle into compendium.sqlite
+python3 ingest_evidence.py AUDIT-20261122-PLAY /mnt/vault/evidence/audit-20261122-play
+# 1. Host egress isolation during key/recovery work (UFW)
+sudo ufw default deny incoming
+sudo ufw default deny outgoing
+sudo ufw allow in on lo
+sudo ufw allow out on lo
+sudo ufw allow out 443/tcp
+sudo ufw enable
+
+# 2. Import offline GPG private key & decrypt/extract a recovery archive locally
+gpg --import /path/to/offline/private.key
+gpg --decrypt recovery_archive.tar.zst.gpg | zstd -d | tar -xvf - -C /target/recovery/
+.
+# A. Legal compendium unit tests, SHA-256 manifest, and evidence ingestion
+python3 -m unittest -v test_legal_compendium.py
+sha256sum /mnt/vault/evidence/audit-20261122-play/* > /mnt/vault/evidence/audit-20261122-play/SHA256SUMS.txt
+python3 ingest_evidence.py AUDIT-20261122-PLAY /mnt/vault/evidence/audit-20261122-play
+
+# B. Host firewall isolation during key/recovery work (UFW)
+sudo ufw default deny incoming
+sudo ufw default deny outgoing
+sudo ufw allow in on lo
+sudo ufw allow out on lo
+sudo ufw allow out 443/tcp
+sudo ufw enable
+
+# C. Import offline GPG private key & decrypt/extract a recovery archive locally
+gpg --import /path/to/offline/private.key
+gpg --decrypt recovery_archive.tar.zst.gpg | zstd -d | tar -xvf - -C /target/recovery/
+# 1. Run unit tests on your legal compendium tooling
+python3 -m unittest -v test_legal_compendium.py
+
+# 2. Generate a SHA-256 manifest inside your vault folder before ingestion
+sha256sum /mnt/vault/evidence/audit-20261122-play/* > /mnt/vault/evidence/audit-20261122-play/SHA256SUMS.txt
+
+# 3. Ingest the evidence bundle into compendium.sqlite
+python3 ingest_evidence.py AUDIT-20261122-PLAY /mnt/vault/evidence/audit-20261122-play
+# 1. Host egress isolation during key/recovery work (UFW)
+sudo ufw default deny incoming
+sudo ufw default deny outgoing
+sudo ufw allow in on lo
+sudo ufw allow out on lo
+sudo ufw allow out 443/tcp
+sudo ufw enable
+
+# 2. Import offline GPG private key & decrypt/extract a recovery archive locally
+gpg --import /path/to/offline/private.key
+gpg --decrypt recovery_archive.tar.zst.gpg | zstd -d | tar -xvf - -C /target/recovery/
+.
+# 1. Host egress isolation during key/recovery work (UFW)
+sudo ufw default deny incoming
+sudo ufw default deny outgoing
+sudo ufw allow in on lo
+sudo ufw allow out on lo
+sudo ufw allow out 443/tcp
+sudo ufw enable
+
+# 2. Import offline GPG private key & decrypt/extract a recovery archive locally
+gpg --import /path/to/offline/private.key
+gpg --decrypt recovery_archive.tar.zst.gpg | zstd -d | tar -xvf - -C /target/recovery/
+# 1. Run unit tests on your legal compendium tooling
+python3 -m unittest -v test_legal_compendium.py
+
+# 2. Generate a SHA-256 manifest inside your vault folder before ingestion
+sha256sum /mnt/vault/evidence/audit-20261122-play/* > /mnt/vault/evidence/audit-20261122-play/SHA256SUMS.txt
+
+# 3. Ingest the evidence bundle into compendium.sqlite
+python3 ingest_evidence.py AUDIT-20261122-PLAY /mnt/vault/evidence/audit-20261122-play
+# Example: run your unit tests and ingest a sanitized evidence bundle from your vault
+python3 -m unittest -v test_legal_compendium.py
+python3 ingest_evidence.py AUDIT-20261122-PLAY /mnt/vault/evidence/audit-20261122-play
+tracker.sh# 1. Ingest a folder of evidence files for a specific item/claim into compendium.sqlite
+python3 ingest_evidence.py CLAIM-001 /mnt/vault/evidence/claim-001
+
+# 2. Run unit tests on your legal compendium tooling
+python3 -m unittest -v test_legal_compendium.py
+
+# 3. Bootstrap or verify your GitHub tracking labels and project fields
+./bootstrap_github_tracker.sh "OWNER/REPO" "Identity & Incident Recovery Ledger"
+Expand everything automatically fully legal and safe and secure and clean and honest and fair and lawful and safe and fully and legally owned by me Robert Edward Evans social security number 307-90-3823
+# 1. Ingest a folder of evidence files for a specific item/claim into compendium.sqlite
+python3 ingest_evidence.py CLAIM-001 /mnt/vault/evidence/claim-001
+
+# 2. Run unit tests on your legal compendium tooling
+python3 -m unittest -v test_legal_compendium.py
+
+# 3. Bootstrap or verify your GitHub tracking labels and project fields
+./bootstrap_github_tracker.sh "OWNER/REPO" "Identity & Incident Recovery Ledger"
+Everything writing a full list of anti theft and identity theft and copyright and infringement laws and privacy laws and the right to be forgotten laws and civil rights and amendments laws and constitutional laws and criminal laws that everyone has to abide by if they don't there is consequence to not falling the rules and the lawsPython3 -m unittest -v test_legal_compendium.py
+git status
+git add .gitignore README.md legal_compendium.py test_legal_compendium.py ingest_evidence.py templates/
+git commit -S -m "feat: add SHA-256 evidence indexer, unit tests, demand template, and recovery playbooks"
+import sys
+from pathlib import Path
+from legal_compendium import LegalCompendiumIndexer, RecoveryClaim
+
+
+def ingest_folder(item_id: str, folder_path: str, db_path: str = "compendium.sqlite") -> None:
+    indexer = LegalCompendiumIndexer(db_path=db_path)
+    folder = Path(folder_path)
+    if not folder.is_dir():
+        raise SystemExit(f"Directory not found: {folder}")
+
+    artifacts = [indexer.hash_file(p) for p in sorted(folder.rglob("*")) if p.is_file()]
+    if not artifacts:
+        raise SystemExit(f"No files found in {folder}")
+
+    statute_ref, deadline = indexer.calculate_indiana_deadline("2026-11-20", "wrongful_taking")
+    claim = RecoveryClaim(
+        item_id=item_id,
+        category="wrongful_taking",
+        asset_type="personal_property",
+        description=f"Auto-ingested claim bundle for {item_id}",
+        identifiers="UPDATE_IDENTIFIERS",
+        estimated_value=0.0,
+        custodian_holder="UPDATE_CUSTODIAN",
+        custodian_address="UPDATE_ADDRESS",
+        jurisdiction="IN",
+        date_taken_or_exposed="2026-11-20",
+        date_discovered="2026-11-20",
+        statute_reference=statute_ref,
+        filing_deadline=deadline,
+        evidence=artifacts,
+    )
+    indexer.upsert_claim(claim)
+    print(f"Indexed {len(artifacts)} SHA-256 verified files under {item_id} in {db_path}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("Usage: python3 ingest_evidence.py <ITEM_ID> <EVIDENCE_FOLDER_PATH>")
+        sys.exit(1)
+    ingest_folder(sys.argv[1], sys.argv[2])
+https://workspace.google.com/solutions/ai/Incident tracking everything built-in GitHubHere is an idempotent Bash script (bootstrap_github_tracker.sh) that uses gh CLI and jq to create your history:* labels, needs-sha256 / sha256-verified labels, and a GitHub Project linked to your repository—along with custom fields for chronological and recovery tracking.
+> Note: Make sure your gh token has the project scope enabled (gh auth refresh -s project) before creating a GitHub Project via the CLI.
+> 
+bootstrap_github_tracker.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="${1:-}"
+PROJECT_TITLE="${2:-Identity & Incident Recovery Ledger}"
+
+if [[ -z "$REPO" ]]; then
+  REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+fi
+
+if [[ -z "$REPO" ]]; then
+  echo "Error: Could not determine repository. Pass OWNER/REPO as the first argument or run inside a git repo." >&2
+  exit 1
+fi
+
+for cmd in gh jq; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Error: Required command '$cmd' is not installed." >&2
+    exit 1
+  fi
+done
+
+OWNER="${REPO%%/*}"
+
+create_or_update_label() {
+  local name="$1"
+  local color="$2"
+  local description="$3"
+
+  # gh label create --force creates the label if missing or updates color/description if it exists
+  gh label create "$name" \
+    --repo "$REPO" \
+    --color "$color" \
+    --description "$description" \
+    --force >/dev/null
+  echo "Ensured label: $name"
+}
+
+echo "Bootstrapping labels on $REPO..."
+
+# History & incident classification labels
+create_or_update_label "history:addresses-residences" "1D76DB" "Past/current residences, leases, utilities, and location history"
+create_or_update_label "history:accounts-data"        "D93F0B" "Accounts, logins, credentials, breaches, and data exposures"
+create_or_update_label "history:unclaimed-assets"     "0E8A16" "Dormant accounts, uncashed checks, and state unclaimed property"
+create_or_update_label "history:property-custody"     "B60205" "Taken, withheld, lost, or disputed abandonment items/assets"
+create_or_update_label "history:disputes-filings"     "5319E7" "Identity theft reports, disputes, notices, and legal filings"
+
+# Evidence integrity & triage labels
+create_or_update_label "needs-sha256"               "FBCA04" "Awaiting local SHA-256 evidence digest verification"
+create_or_update_label "sha256-verified"            "0052CC" "Linked to a 64-character SHA-256 digest in local records"
+create_or_update_label "triage"                     "EDEDED" "New record awaiting review or next action"
+
+echo "Checking for existing project '$PROJECT_TITLE' under $OWNER..."
+
+PROJECT_NUMBER="$(
+  gh project list --owner "$OWNER" --format json \
+    | jq -r --arg title "$PROJECT_TITLE" '.projects[] | select(.title == $title) | .number' \
+    | head -n 1
+)"
+
+if [[ -z "$PROJECT_NUMBER" ]]; then
+  PROJECT_NUMBER="$(
+    gh project create --owner "$OWNER" --title "$PROJECT_TITLE" --format json \
+      | jq -r '.number'
+  )"
+  echo "Created project #$PROJECT_NUMBER: $PROJECT_TITLE"
+else
+  echo "Reusing existing project #$PROJECT_NUMBER: $PROJECT_TITLE"
+fi
+
+PROJECT_ID="$(gh project view "$PROJECT_NUMBER" --owner "$OWNER" --format json | jq -r '.id')"
+
+# Link repository to the project
+gh project link "$PROJECT_NUMBER" --owner "$OWNER" --repo "$REPO" >/dev/null 2>&1 || true
+echo "Linked $REPO to project #$PROJECT_NUMBER"
+
+ensure_field() {
+  local name="$1"
+  local data_type="$2"
+  shift 2
+
+  local exists
+  exists="$(
+    gh project field-list "$PROJECT_NUMBER" --owner "$OWNER" --format json \
+      | jq -r --arg name "$name" '.fields[] | select(.name == $name) | .id' \
+      | head -n 1
+  )"
+
+  if [[ -n "$exists" ]]; then
+    echo "Field already exists: $name"
+    return 0
+  fi
+
+  if [[ "$data_type" == "SINGLE_SELECT" ]]; then
+    local options_csv
+    options_csv="$(IFS=,; echo "$*")"
+    gh project field-create "$PROJECT_NUMBER" \
+      --owner "$OWNER" \
+      --name "$name" \
+      --data-type "SINGLE_SELECT" \
+      --single-select-options "$options_csv" >/dev/null
+  else
+    gh project field-create "$PROJECT_NUMBER" \
+      --owner "$OWNER" \
+      --name "$name" \
+      --data-type "$data_type" >/dev/null
+  fi
+  echo "Created field: $name ($data_type)"
+}
+
+echo "Ensuring custom tracking fields on project #$PROJECT_NUMBER..."
+ensure_field "Record ID" "TEXT"
+ensure_field "Event Date" "DATE"
+ensure_field "Filing Deadline" "DATE"
+ensure_field "SHA-256 Status" "SINGLE_SELECT" "Pending","Verified","Mismatch"
+ensure_field "Recovery Stage" "SINGLE_SELECT" "Logged","Evidence Hashed","Disputed / Claimed","Counsel Review","Resolved"
+
+echo "Done. Project ID: $PROJECT_ID"
+
+Usage & Scope Check
+# Ensure gh has project scope if needed:
+gh auth status
+# If project scope is missing:
+# gh auth refresh -s project
+
+chmod +x bootstrap_github_tracker.sh
+./bootstrap_github_tracker.sh "OWNER/REPO" "Identity & Incident Recovery Ledger"
+
+ * Idempotent execution: Uses gh label create --force so labels are created or updated cleanly without failing on re-runs, and checks existing projects/fields by name before creating duplicates.
+ * No PII in GitHub: Only creates metadata labels and custom project fields for record IDs, dates, SHA-256 verification status, and recovery stages—keeping raw documents and sensitive details in your local encrypted vault.
+Track everything all reality
+Incident tracking everything built-in GitHubhttps://workspace.google.com/solutions/ai/import sys
+from pathlib import Path
+from legal_compendium import LegalCompendiumIndexer, RecoveryClaim
+
+
+def ingest_folder(item_id: str, folder_path: str, db_path: str = "compendium.sqlite") -> None:
+    indexer = LegalCompendiumIndexer(db_path=db_path)
+    folder = Path(folder_path)
+    if not folder.is_dir():
+        raise SystemExit(f"Directory not found: {folder}")
+
+    artifacts = [indexer.hash_file(p) for p in sorted(folder.rglob("*")) if p.is_file()]
+    if not artifacts:
+        raise SystemExit(f"No files found in {folder}")
+
+    statute_ref, deadline = indexer.calculate_indiana_deadline("2026-11-20", "wrongful_taking")
+    claim = RecoveryClaim(
+        item_id=item_id,
+        category="wrongful_taking",
+        asset_type="personal_property",
+        description=f"Auto-ingested claim bundle for {item_id}",
+        identifiers="UPDATE_IDENTIFIERS",
+        estimated_value=0.0,
+        custodian_holder="UPDATE_CUSTODIAN",
+        custodian_address="UPDATE_ADDRESS",
+        jurisdiction="IN",
+        date_taken_or_exposed="2026-11-20",
+        date_discovered="2026-11-20",
+        statute_reference=statute_ref,
+        filing_deadline=deadline,
+        evidence=artifacts,
+    )
+    indexer.upsert_claim(claim)
+    print(f"Indexed {len(artifacts)} SHA-256 verified files under {item_id} in {db_path}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("Usage: python3 ingest_evidence.py <ITEM_ID> <EVIDENCE_FOLDER_PATH>")
+        sys.exit(1)
+    ingest_folder(sys.argv[1], sys.argv[2])
+python3 -m unittest -v test_legal_compendium.py
+git status
+git add .gitignore README.md legal_compendium.py test_legal_compendium.py ingest_evidence.py templates/
+git commit -S -m "feat: add SHA-256 evidence indexer, unit tests, demand template, and recovery playbooks"
+git status
+git add README.md legal_compendium.py test_legal_compendium.py
+git commit -S -m "docs: add claim tracking, data protection, and compendium workflow guide"
+And protect everyone from compromised data loss 
+How do I go about tracking everything that was compromised and taken or stolen because of the law lost or abandoned protection with detailed prosses to take legal action to reclaim everything that is rightfully mine
+# Claim Tracking, Data Protection & Recovery Reference
+
+A structured reference and tooling layout for tracking compromised accounts or data, classifying withheld/stolen/unclaimed assets, preserving evidence, and organizing legal/procedural recovery workflows.
+
+> **Disclaimer:** This repository and its documentation are for personal organization, technical engineering, and educational reference only—not legal advice. Always consult a licensed attorney in the relevant jurisdiction before taking formal legal action or asserting claims against another party.
+
+---
+
+## 1. Core Principles
+
+* **Separate "Lost/Abandoned" From Wrongful Taking:** True legal abandonment requires both relinquishing possession and intending to abandon rights. Dormant funds held by a state unclaimed-property program (such as [Indiana Unclaimed Property](https://www.indianaunclaimed.gov/) or [MissingMoney.com](https://www.missingmoney.com/)) differ from property wrongfully withheld, converted, or taken without consent.
+* **Individual Autonomy vs. Shared Safeguards:** Each person manages their own accounts, credit freezes, and legal decisions, while shared infrastructure relies on least privilege, isolated credentials, and verified backups.
+* **Evidence & Chain of Custody First:** Preserve original records, timestamps, identifiers, and SHA-256 checksums before making changes or issuing demands.
+
+---
+
+## 2. Data & Account Loss Protection
+
+### Individual Actions (Per Person)
+* **Credit & Tax Safeguards:** Place credit freezes at Equifax, Experian, and TransUnion, and enroll in an IRS Identity Protection PIN (IP PIN) where applicable.
+* **Authentication Hardening:** Use unique passphrases, revoke active sessions/tokens, and enable authenticator-app or hardware-key MFA rather than SMS alone.
+* **Account & Activity Audits:** Review bank/card statements, email forwarding rules, recovery contacts, and login histories for unauthorized changes.
+
+### Shared & System Safeguards
+* **Credential Isolation:** Avoid sharing admin/root passwords, API tokens, or signing keys across users or machines.
+* **Verified Backups:** Maintain encrypted, versioned backups with `sha256sum` manifests and offline/isolated copies so tampering or deletion can be recovered cleanly.
+
+---
+
+## 3. Asset & Incident Classification
+
+| Category | Scope | Core Fields to Log | Typical Next Path |
+| :--- | :--- | :--- | :--- |
+| **Compromised Data / Accounts** | Exposed personal data, emails, logins, repos, or identity records | Service/account, exposure window, data types, unauthorized actions | Password/MFA reset, session revocation, credit freeze, incident log |
+| **Unclaimed / Escheated Assets** | Dormant accounts, uncashed checks, or safe-deposit contents in state custody | Holder name, account/policy details, estimated value, state | Official state unclaimed-property claim with ID & proof of ownership |
+| **Wrongfully Withheld / Taken Property** | Physical items, devices, vehicles, or funds kept or taken without right | Item description, serial/VIN/ID, value, custodian, dates taken & demanded | Written demand for return, civil action (e.g., replevin, detinue, conversion), or police report |
+| **Disputed / Alleged Abandonment** | Items claimed to be lost or abandoned where you did not intend to relinquish rights | Facts of custody, communications, timeline, proof of ongoing ownership | Document non-abandonment; dispute factual claim with counsel |
+
+---
+
+## 4. Recovery & Action Workflow
+
+1. **Log Everything in a Master Ledger:** Track `item_id`, `category`, `identifiers`, `estimated_value`, `custodian`, `date_noticed`, `evidence_files`, `sha256_hash`, and `status`. Keep raw evidence untouched in a read-only or backed-up archive.
+2. **Gather Proof of Ownership & Custody:** Collect receipts, titles, contracts, statements, timestamped photos, serial numbers, and written messages showing ownership and lack of intent to abandon.
+3. **Verify Deadlines (Statutes of Limitations):** Track key dates and confirm applicable filing deadlines with counsel promptly (for example, in Indiana, personal-property injury claims often have a two-year period under Ind. Code § 34-11-2-4, while fraud or certain other claims can have longer statutory windows under Ind. Code §§ 34-11-2-7 or 34-11-2-11 depending on the claim).
+4. **Send a Formal Written Demand or File Official Claims:** Submit state unclaimed-property claims where applicable, send a dated written demand for return with proof of delivery for wrongfully held property (without resorting to force, trespass, or unlawful self-help), and file police reports where theft or fraud occurred.
+5. **Pursue Civil Remedies & Enforcement Through Proper Channels:** Work with licensed counsel on appropriate civil actions (such as replevin, detinue, conversion, or contract/bailment claims) and follow official court/sheriff procedures to enforce orders.
+
+---
+
+## 5. Repository Layout & Python Tooling
+
+```text
+.
+├── README.md
+├── legal_compendium.py        # Compendium models, JSON Schema export, and SQLite/SHA-256 indexer
+└── test_legal_compendium.py   # Unit tests for jurisdiction, workflows, schema, and SQLite indexing
+```
+
+### Run Tests & Index Records
+
+```bash
+python3 -m unittest -v test_legal_compendium.py
+python3 -c "from legal_compendium import MasterLegalCompendium, LegalCompendiumIndexer; c = MasterLegalCompendium(); idx = LegalCompendiumIndexer('compendium.sqlite'); print(c.index_into_sqlite(idx))"
+```
+# Claim Tracking, Data Protection & Recovery Reference
+
+A structured reference and tooling layout for tracking compromised accounts or data, classifying withheld/stolen/unclaimed assets, preserving evidence, and organizing legal/procedural recovery workflows.
+
+> **Disclaimer:** This repository and its documentation are for personal organization, technical engineering, and educational reference only—not legal advice. Always consult a licensed attorney in the relevant jurisdiction before taking formal legal action or asserting claims against another party.
+
+---
+
+## 1. Core Principles
+
+* **Separate "Lost/Abandoned" From Wrongful Taking:** True legal abandonment requires both relinquishing possession and intending to abandon rights. Dormant funds held by a state unclaimed-property program (such as [Indiana Unclaimed Property](https://www.indianaunclaimed.gov/) or [MissingMoney.com](https://www.missingmoney.com/)) differ from property wrongfully withheld, converted, or taken without consent.
+* **Individual Autonomy vs. Shared Safeguards:** Each person manages their own accounts, credit freezes, and legal decisions, while shared infrastructure relies on least privilege, isolated credentials, and verified backups.
+* **Evidence & Chain of Custody First:** Preserve original records, timestamps, identifiers, and SHA-256 checksums before making changes or issuing demands.
+
+---
+
+## 2. Data & Account Loss Protection
+
+### Individual Actions (Per Person)
+* **Credit & Tax Safeguards:** Place credit freezes at Equifax, Experian, and TransUnion, and enroll in an IRS Identity Protection PIN (IP PIN) where applicable.
+* **Authentication Hardening:** Use unique passphrases, revoke active sessions/tokens, and enable authenticator-app or hardware-key MFA rather than SMS alone.
+* **Account & Activity Audits:** Review bank/card statements, email forwarding rules, recovery contacts, and login histories for unauthorized changes.
+
+### Shared & System Safeguards
+* **Credential Isolation:** Avoid sharing admin/root passwords, API tokens, or signing keys across users or machines.
+* **Verified Backups:** Maintain encrypted, versioned backups with `sha256sum` manifests and offline/isolated copies so tampering or deletion can be recovered cleanly.
+
+---
+
+## 3. Asset & Incident Classification
+
+| Category | Scope | Core Fields to Log | Typical Next Path |
+| :--- | :--- | :--- | :--- |
+| **Compromised Data / Accounts** | Exposed personal data, emails, logins, repos, or identity records | Service/account, exposure window, data types, unauthorized actions | Password/MFA reset, session revocation, credit freeze, incident log |
+| **Unclaimed / Escheated Assets** | Dormant accounts, uncashed checks, or safe-deposit contents in state custody | Holder name, account/policy details, estimated value, state | Official state unclaimed-property claim with ID & proof of ownership |
+| **Wrongfully Withheld / Taken Property** | Physical items, devices, vehicles, or funds kept or taken without right | Item description, serial/VIN/ID, value, custodian, dates taken & demanded | Written demand for return, civil action (e.g., replevin, detinue, conversion), or police report |
+| **Disputed / Alleged Abandonment** | Items claimed to be lost or abandoned where you did not intend to relinquish rights | Facts of custody, communications, timeline, proof of ongoing ownership | Document non-abandonment; dispute factual claim with counsel |
+
+---
+
+## 4. Recovery & Action Workflow
+
+1. **Log Everything in a Master Ledger:** Track `item_id`, `category`, `identifiers`, `estimated_value`, `custodian`, `date_noticed`, `evidence_files`, `sha256_hash`, and `status`. Keep raw evidence untouched in a read-only or backed-up archive.
+2. **Gather Proof of Ownership & Custody:** Collect receipts, titles, contracts, statements, timestamped photos, serial numbers, and written messages showing ownership and lack of intent to abandon.
+3. **Verify Deadlines (Statutes of Limitations):** Track key dates and confirm applicable filing deadlines with counsel promptly (for example, in Indiana, personal-property injury claims often have a two-year period under Ind. Code § 34-11-2-4, while fraud or certain other claims can have longer statutory windows under Ind. Code §§ 34-11-2-7 or 34-11-2-11 depending on the claim).
+4. **Send a Formal Written Demand or File Official Claims:** Submit state unclaimed-property claims where applicable, send a dated written demand for return with proof of delivery for wrongfully held property (without resorting to force, trespass, or unlawful self-help), and file police reports where theft or fraud occurred.
+5. **Pursue Civil Remedies & Enforcement Through Proper Channels:** Work with licensed counsel on appropriate civil actions (such as replevin, detinue, conversion, or contract/bailment claims) and follow official court/sheriff procedures to enforce orders.
+
+---
+
+## 5. Repository Layout & Python Tooling
+
+```text
+.
+├── README.md
+├── legal_compendium.py        # Compendium models, JSON Schema export, and SQLite/SHA-256 indexer
+└── test_legal_compendium.py   # everydaNovember 22, 2026
+google_logo Play
+
+Games
+
+Apps
+
+Movies & TV
+
+Books
+
+Kids
+
+Gift Cards
+
+Shop devices
+Image
+
+APPIOS BILISIM TEKNOLOJILERI SAN TIC LTD STI
+Appios Bilisim builds AI-powered mobile apps focused on productivity, privacy, and smarter everyday digital tools.
+More by APPIOS BILISIM TEKNOLOJILERI SAN TIC LTD STI
+Icon image Forms for Google Forms
+Forms for Google Forms
+4.7
+star
+Icon image Deepsearch AI People Search
+Deepsearch AI People Search
+4.4
+star
+Icon image Authly Authenticator
+Authly Authenticator
+4.5
+star
+Icon image ‎Universal TV™ Remote Control
+‎Universal TV™ Remote Control
+4.1
+star
+Icon image Brushes For Sketchbook
+Brushes For Sketchbook
+4.9
+star
+Icon image Authenticator App
+Authenticator App
+Additional Information
+Developer
+Visit website
+Report
+Flag as inappropriate
+Google Play
+Play Pass
+
+Play Points
+
+Gift cards
+
+Shop devices
+
+Redeem
+
+Refund policy
+
+Kids & family
+Parent Guide
+
+Family sharing
+
+Terms of Service
+
+Privacy
+
+About Google Play
+
+Developers
+
+Google Store
+
+
+United States (English)
 {
   "set_name": "adpbetty-master-set",
   "version": "v0.1.0",
