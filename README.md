@@ -1,3 +1,296 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="."
+MANIFEST_PATH=""
+PROVENANCE_PATH=""
+BUNDLE_OUT=""
+ZSTD_LEVEL="${ZSTD_LEVEL:-3}"
+LOG_DIR="${PIPELINE_LOG_DIR:-${HOME}/.local/state/master_pipeline}"
+LOG_FILE="${LOG_DIR}/pipeline_runs.jsonl"
+
+REQUIRED_PATHS=()
+FORBIDDEN_NAMES=()
+
+# Allow positional arguments first for backward compatibility:
+#   run_master_pipeline.sh [ROOT_DIR] [MANIFEST_PATH] [PROVENANCE_PATH] [--flag value ...]
+if [[ $# -gt 0 && "${1}" != --* ]]; then
+  ROOT_DIR="${1}"
+  shift
+fi
+if [[ $# -gt 0 && "${1}" != --* ]]; then
+  MANIFEST_PATH="${1}"
+  shift
+fi
+if [[ $# -gt 0 && "${1}" != --* ]]; then
+  PROVENANCE_PATH="${1}"
+  shift
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --root)
+      ROOT_DIR="${2:?--root requires a path}"
+      shift 2
+      ;;
+    --manifest)
+      MANIFEST_PATH="${2:?--manifest requires a path}"
+      shift 2
+      ;;
+    --provenance)
+      PROVENANCE_PATH="${2:?--provenance requires a path}"
+      shift 2
+      ;;
+    --bundle-out)
+      BUNDLE_OUT="${2:?--bundle-out requires a path}"
+      shift 2
+      ;;
+    --zstd-level)
+      ZSTD_LEVEL="${2:?--zstd-level requires an integer}"
+      shift 2
+      ;;
+    --require-path)
+      REQUIRED_PATHS+=("${2:?--require-path requires a relative path}")
+      shift 2
+      ;;
+    --forbid-name)
+      FORBIDDEN_NAMES+=("${2:?--forbid-name requires a file or directory name}")
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+mkdir -p "${LOG_DIR}"
+ABS_ROOT="$(cd "${ROOT_DIR}" && pwd)"
+
+json_escape() {
+  python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$1"
+}
+
+record_run() {
+  local status="$1"
+  local detail="$2"
+  local ts_utc
+  ts_utc="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
+
+  printf '{"timestamp_utc":%s,"root":%s,"status":%s,"detail":%s}\n' \
+    "$(json_escape "${ts_utc}")" \
+    "$(json_escape "${ABS_ROOT}")" \
+    "$(json_escape "${status}")" \
+    "$(json_escape "${detail}")" >> "${LOG_FILE}"
+}
+
+on_error() {
+  local exit_code="$?"
+  record_run "FAILED" "exit_code=${exit_code}"
+  exit "${exit_code}"
+}
+
+trap on_error ERR
+
+AUDIT_CMD=(python3 scripts/local_workspace_audit.py --root "${ABS_ROOT}")
+if [[ -n "${MANIFEST_PATH}" ]]; then
+  AUDIT_CMD+=(--manifest "${MANIFEST_PATH}")
+fi
+for req_path in "${REQUIRED_PATHS[@]}"; do
+  AUDIT_CMD+=(--require-path "${req_path}")
+done
+for bad_name in "${FORBIDDEN_NAMES[@]}"; do
+  AUDIT_CMD+=(--forbid-name "${bad_name}")
+done
+
+GUARD_CMD=(python3 scripts/clean_pipeline_guard.py --root "${ABS_ROOT}")
+if [[ -n "${PROVENANCE_PATH}" ]]; then
+  GUARD_CMD+=(--provenance "${PROVENANCE_PATH}")
+fi
+
+echo "[1/4] Running local workspace & manifest audit..."
+"${AUDIT_CMD[@]}"
+
+echo "[2/4] Running clean pipeline & provenance guard..."
+"${GUARD_CMD[@]}"
+
+echo "[3/4] Running pytest suite..."
+pytest -q
+
+if [[ -n "${BUNDLE_OUT}" ]]; then
+  echo "[4/4] Packaging deterministic bundle & verifying SHA-256 sidecar..."
+  python3 scripts/package_bundle.py \
+    --source "${ABS_ROOT}" \
+    --out "${BUNDLE_OUT}" \
+    --level "${ZSTD_LEVEL}"
+
+  BUNDLE_DIR="$(cd "$(dirname "${BUNDLE_OUT}")" && pwd)"
+  BUNDLE_FILE="$(basename "${BUNDLE_OUT}")"
+  (cd "${BUNDLE_DIR}" && sha256sum -c "${BUNDLE_FILE}.sha256")
+  record_run "PASSED" "bundle=${BUNDLE_OUT}"
+else
+  echo "[4/4] Skipping bundle packaging (no --bundle-out specified)."
+  record_run "PASSED" "audit+guard+pytest"
+fi
+
+trap - ERR
+echo "Master pipeline passed. Logged to ${LOG_FILE}"
+#!/usr/bin/env python3
+"""Audit a local workspace directory, manifest checksums, and policy rules."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import sys
+from pathlib import Path
+
+IGNORED_DIRS = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+
+
+def parse_manifest(manifest_path: Path) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    for line_no, raw_line in enumerate(manifest_path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = raw_line.rstrip("\r\n").split("  ", maxsplit=1)
+        if len(parts) != 2:
+            parts = raw_line.rstrip("\r\n").split(" *", maxsplit=1)
+        if len(parts) != 2:
+            raise ValueError(f"{manifest_path}:{line_no}: malformed manifest line")
+        digest, rel_path = parts[0].strip().lower(), parts[1].strip()
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError(f"{manifest_path}:{line_no}: invalid SHA-256 digest")
+        entries.append((digest, rel_path))
+    return entries
+
+
+def sha256_file(file_path: Path) -> str:
+    h = hashlib.sha256()
+    with file_path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _is_within_root(target: Path, root_resolved: Path) -> bool:
+    try:
+        target.relative_to(root_resolved)
+        return True
+    except ValueError:
+        return False
+
+
+def audit_workspace(
+    root: Path,
+    manifest: Path | None,
+    required_paths: tuple[str, ...] | list[str] = (),
+    forbidden_names: tuple[str, ...] | list[str] = (),
+) -> list[str]:
+    errors: list[str] = []
+    if not root.exists() or not root.is_dir():
+        return [f"Root directory does not exist or is not a directory: {root}"]
+
+    root_resolved = root.resolve()
+
+    for req_rel in required_paths:
+        req_target = (root_resolved / req_rel).resolve()
+        if not _is_within_root(req_target, root_resolved):
+            errors.append(f"Required path escapes root: {req_rel}")
+            continue
+        if not req_target.exists():
+            errors.append(f"Missing required workspace path: {req_rel}")
+
+    if forbidden_names:
+        forbidden_set = set(forbidden_names)
+        for path in root_resolved.rglob("*"):
+            if any(part in IGNORED_DIRS for part in path.parts):
+                continue
+            if path.name in forbidden_set:
+                errors.append(f"Forbidden workspace item found: {path.relative_to(root_resolved)}")
+
+    if manifest is not None:
+        if not manifest.is_file():
+            errors.append(f"Manifest file not found: {manifest}")
+            return errors
+        try:
+            entries = parse_manifest(manifest)
+        except ValueError as exc:
+            errors.append(str(exc))
+            return errors
+
+        for expected_digest, rel_path in entries:
+            target = (root_resolved / rel_path).resolve()
+            if not _is_within_root(target, root_resolved):
+                errors.append(f"Manifest path escapes root: {rel_path}")
+                continue
+            if not target.is_file():
+                errors.append(f"Missing manifest artifact: {rel_path}")
+                continue
+            actual_digest = sha256_file(target)
+            if actual_digest != expected_digest:
+                errors.append(
+                    f"Checksum mismatch for {rel_path}: expected {expected_digest}, got {actual_digest}"
+                )
+
+    return errors
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Audit local workspace and SHA256SUMS manifest.")
+    parser.add_argument("--root", required=True, help="Repository or workspace root directory")
+    parser.add_argument("--manifest", default="", help="Optional path to SHA256SUMS manifest")
+    parser.add_argument(
+        "--require-path",
+        action="append",
+        default=[],
+        help="Relative path that must exist under --root (repeatable)",
+    )
+    parser.add_argument(
+        "--forbid-name",
+        action="append",
+        default=[],
+        help="File or directory name forbidden under --root (repeatable)",
+    )
+    args = parser.parse_args(argv)
+
+    root = Path(args.root)
+    manifest = Path(args.manifest) if args.manifest else None
+    errors = audit_workspace(
+        root=root,
+        manifest=manifest,
+        required_paths=args.require_path,
+        forbidden_names=args.forbid_name,
+    )
+
+    if errors:
+        for err in errors:
+            print(f"[AUDIT FAIL] {err}", file=sys.stderr)
+        return 1
+
+    print(f"[AUDIT OK] root={root.resolve()}" + (f" manifest={manifest}" if manifest else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+chmod +x \
+  scripts/run_master_pipeline.sh \
+  scripts/local_workspace_audit.py \
+  scripts/clean_pipeline_guard.py \
+  scripts/package_bundle.py
+
+bash scripts/run_master_pipeline.sh \
+  --root . \
+  --manifest build/SHA256SUMS \
+  --provenance config/provenance.json \
+  --require-path README.md \
+  --forbid-name .DS_Store \
+  --bundle-out build/workspace_bundle.tar.zst
+
+tail -n 5 "${HOME}/.local/state/master_pipeline/pipeline.sh"
+
 bundle.pychmod +x scripts/package_bundle.py
 
 # 1. Build a checksummed .tar.zst bundle into build/
